@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SAGUI internal design document (kept out of version control)
+sagui_context.md
+
+# Training artefacts
+runs/
+*.pt
+*.ckpt
+!examples/*.pt
+
+# CLAUDE
+CLAUDE.md

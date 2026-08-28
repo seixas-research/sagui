@@ -1,0 +1,262 @@
+"""Physical invariants that any interatomic potential must satisfy.
+
+These are the tests that matter: a potential that is not invariant under
+rotations, or whose forces are not the gradient of its energy, is wrong no
+matter how low its training loss goes.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+from ase import Atoms
+from ase.build import bulk
+
+from sagui.config import ModelConfig
+from sagui.data import ZTable, collate_graphs, graph_from_atoms
+from sagui.models import available_models, build_model, get_model_class, register_model
+from sagui.models.base import InteratomicPotential
+from sagui.nn.o3 import rotation_matrix
+
+ARCHITECTURES = list(available_models())
+R_MAX = 4.5
+
+
+def make_model(architecture: str, z_table: ZTable, **overrides) -> InteratomicPotential:
+    settings = dict(
+        type=architecture,
+        r_max=R_MAX,
+        lmax=2,
+        channels=8,
+        num_layers=2,
+        num_radial_basis=6,
+        radial_mlp_hidden=[16],
+        scalar_mlp_hidden=[16],
+        latent_dim=16,
+        correlation=3,
+    )
+    settings.update(overrides)
+    return build_model(ModelConfig(**settings), z_table.zs, avg_num_neighbors=6.0)
+
+
+def predict(model, atoms: Atoms, z_table: ZTable) -> dict[str, torch.Tensor]:
+    graph = graph_from_atoms(atoms, z_table, R_MAX, with_labels=False)
+    return model(collate_graphs([graph]), compute_forces=True, training=False)
+
+
+def test_both_required_architectures_are_registered():
+    assert set(ARCHITECTURES) >= {"mace", "strictly_local"}
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_output_shapes(architecture, cluster):
+    z_table = ZTable.from_atoms([cluster])
+    out = predict(make_model(architecture, z_table), cluster, z_table)
+    assert out["energy"].shape == (1,)
+    assert out["node_energy"].shape == (len(cluster),)
+    assert out["forces"].shape == (len(cluster), 3)
+    assert torch.isfinite(out["energy"]).all() and torch.isfinite(out["forces"]).all()
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_translation_invariance(architecture, cluster):
+    z_table = ZTable.from_atoms([cluster])
+    model = make_model(architecture, z_table)
+    reference = predict(model, cluster, z_table)
+
+    moved = cluster.copy()
+    moved.positions += np.array([3.7, -2.1, 0.6])
+    shifted = predict(model, moved, z_table)
+
+    assert torch.allclose(shifted["energy"], reference["energy"], atol=1e-10)
+    assert torch.allclose(shifted["forces"], reference["forces"], atol=1e-10)
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_rotation_equivariance(architecture, cluster):
+    """Energy is invariant, forces rotate with the structure."""
+    z_table = ZTable.from_atoms([cluster])
+    model = make_model(architecture, z_table)
+    reference = predict(model, cluster, z_table)
+
+    R = rotation_matrix(0.42, 1.13, 2.31).numpy()
+    rotated_atoms = cluster.copy()
+    rotated_atoms.positions = rotated_atoms.positions @ R.T
+    rotated = predict(model, rotated_atoms, z_table)
+
+    assert torch.allclose(rotated["energy"], reference["energy"], atol=1e-10)
+    assert torch.allclose(rotated["forces"], reference["forces"] @ torch.as_tensor(R.T), atol=1e-10)
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_reflection_equivariance(architecture, cluster):
+    """Full O(3), not just SO(3): the parity selection rule must hold."""
+    z_table = ZTable.from_atoms([cluster])
+    model = make_model(architecture, z_table)
+    reference = predict(model, cluster, z_table)
+
+    mirror = np.diag([1.0, 1.0, -1.0])
+    reflected_atoms = cluster.copy()
+    reflected_atoms.positions = reflected_atoms.positions @ mirror.T
+    reflected = predict(model, reflected_atoms, z_table)
+
+    assert torch.allclose(reflected["energy"], reference["energy"], atol=1e-10)
+    assert torch.allclose(
+        reflected["forces"], reference["forces"] @ torch.as_tensor(mirror.T), atol=1e-10
+    )
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_permutation_invariance(architecture, cluster):
+    """Relabelling identical atoms must permute the forces, nothing else."""
+    z_table = ZTable.from_atoms([cluster])
+    model = make_model(architecture, z_table)
+    reference = predict(model, cluster, z_table)
+
+    order = np.argsort(cluster.get_atomic_numbers(), kind="stable")[::-1].copy()
+    permuted = cluster[order]
+    result = predict(model, permuted, z_table)
+
+    assert torch.allclose(result["energy"], reference["energy"], atol=1e-10)
+    assert torch.allclose(result["forces"], reference["forces"][order.tolist()], atol=1e-10)
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_forces_are_minus_the_energy_gradient(architecture, cluster):
+    """Central finite differences against the autograd forces."""
+    z_table = ZTable.from_atoms([cluster])
+    model = make_model(architecture, z_table)
+    analytic = predict(model, cluster, z_table)["forces"]
+
+    eps = 1e-6
+    for atom, axis in [(0, 0), (2, 1), (5, 2)]:
+        plus, minus = cluster.copy(), cluster.copy()
+        plus.positions[atom, axis] += eps
+        minus.positions[atom, axis] -= eps
+        derivative = (
+            predict(model, plus, z_table)["energy"] - predict(model, minus, z_table)["energy"]
+        ) / (2 * eps)
+        assert torch.allclose(analytic[atom, axis], -derivative[0], atol=1e-7)
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_batching_matches_individual_evaluation(architecture, labelled_frames):
+    """A batch is only a bookkeeping device: results must be identical."""
+    z_table = ZTable.from_atoms(labelled_frames)
+    model = make_model(architecture, z_table)
+    frames = labelled_frames[:4]
+
+    graphs = [graph_from_atoms(a, z_table, R_MAX, with_labels=False) for a in frames]
+    batched = model(collate_graphs(graphs), compute_forces=True, training=False)
+    individually = [
+        model(collate_graphs([g]), compute_forces=True, training=False) for g in graphs
+    ]
+
+    assert torch.allclose(
+        batched["energy"], torch.cat([o["energy"] for o in individually]), atol=1e-10
+    )
+    assert torch.allclose(
+        batched["forces"], torch.cat([o["forces"] for o in individually]), atol=1e-10
+    )
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_energy_is_size_extensive(architecture):
+    """A perfect 2x1x1 supercell must have exactly twice the energy."""
+    unit = bulk("Cu", "fcc", a=3.6, cubic=True)
+    super_cell = unit * (2, 1, 1)
+    z_table = ZTable.from_atoms([unit])
+    model = make_model(architecture, z_table)
+
+    single = predict(model, unit, z_table)["energy"]
+    doubled = predict(model, super_cell, z_table)["energy"]
+    assert torch.allclose(doubled, 2.0 * single, rtol=1e-9)
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_isolated_atom_has_no_forces_and_no_geometry_dependence(architecture):
+    """With no neighbours there is nothing to depend on: the energy is a
+    per-element constant and the forces vanish."""
+    z_table = ZTable([1, 8])
+    model = make_model(architecture, z_table, num_layers=1)
+    here = Atoms("O", positions=[[0.0, 0.0, 0.0]])
+    there = Atoms("O", positions=[[11.0, -4.0, 3.0]])
+
+    out = predict(model, here, z_table)
+    assert torch.allclose(out["forces"], torch.zeros(1, 3), atol=1e-12)
+    assert torch.allclose(out["energy"], predict(model, there, z_table)["energy"], atol=1e-12)
+
+    # Two atoms further apart than the receptive field cannot interact.
+    pair = Atoms("O2", positions=[[0.0, 0.0, 0.0], [40.0, 0.0, 0.0]])
+    assert torch.allclose(predict(model, pair, z_table)["energy"], 2.0 * out["energy"], atol=1e-10)
+
+
+def test_strictly_local_isolated_atom_is_exactly_the_reference_energy():
+    """Its energy is a sum over *pairs*, so an atom with no neighbours
+    contributes exactly its reference energy -- a message-passing model
+    instead keeps a learned per-element constant from the self-interaction."""
+    z_table = ZTable([1, 8])
+    config = ModelConfig(type="strictly_local", r_max=R_MAX, lmax=1, channels=4, num_layers=1)
+    model = build_model(
+        config, z_table.zs, atomic_energies=[-13.6, -2000.0], avg_num_neighbors=1.0
+    )
+    out = predict(model, Atoms("O", positions=[[0.0, 0.0, 0.0]]), z_table)
+    assert float(out["energy"]) == pytest.approx(-2000.0)
+
+
+def _energy_response_of_atom_zero(model, z_table, displacement: float) -> float:
+    """How much the energy of atom 0 changes when a distant atom is moved.
+
+    The three atoms sit in a line, each pair one 0.8 cutoff apart, so atom 2 is
+    1.6 cutoffs from atom 0: outside the range of a single hop, inside the
+    range of two.
+    """
+    spacing = R_MAX * 0.8
+    atoms = Atoms(
+        "H3", positions=[[0.0, 0.0, 0.0], [spacing, 0.0, 0.0], [2 * spacing, 0.0, 0.0]]
+    )
+    moved = atoms.copy()
+    moved.positions[2, 1] += displacement
+
+    before = predict(model, atoms, z_table)["node_energy"][0]
+    after = predict(model, moved, z_table)["node_energy"][0]
+    return float((after - before).abs())
+
+
+def test_strictly_local_receptive_field_is_one_cutoff():
+    """The defining property of the Allegro-style model: moving an atom more
+    than one cutoff away leaves the central atom's energy *bit-for-bit* the
+    same, however many layers are stacked."""
+    z_table = ZTable([1])
+    model = make_model("strictly_local", z_table, num_layers=3)
+    assert _energy_response_of_atom_zero(model, z_table, 1.0) < 1e-14
+
+
+def test_message_passing_reaches_beyond_one_cutoff():
+    """The counterpart: two MACE layers propagate information two cutoffs, so
+    the same displacement does move the central atom's energy."""
+    z_table = ZTable([1])
+    two_layers = make_model("mace", z_table, num_layers=2)
+    assert _energy_response_of_atom_zero(two_layers, z_table, 1.0) > 1e-10
+    # ... and one layer alone does not.
+    one_layer = make_model("mace", z_table, num_layers=1)
+    assert _energy_response_of_atom_zero(one_layer, z_table, 1.0) < 1e-14
+
+
+def test_registry_rejects_unknown_architectures():
+    with pytest.raises(KeyError, match="unknown architecture"):
+        get_model_class("does_not_exist")
+
+
+def test_registry_accepts_new_architectures():
+    @register_model("test_dummy")
+    class Dummy(InteratomicPotential):
+        def __init__(self, config, atomic_numbers, **kwargs):
+            super().__init__(config.r_max, atomic_numbers, **kwargs)
+
+        def node_energies(self, data, vectors, lengths):
+            return vectors.new_zeros(data.num_nodes)
+
+    assert "test_dummy" in available_models()
+    assert isinstance(build_model(ModelConfig(type="test_dummy"), [1]), Dummy)

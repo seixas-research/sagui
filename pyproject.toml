@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sagui"
+dynamic = ["version"]
+authors = [
+  { name="Leandro Seixas Rocha", email="leandro.rocha@ilum.cnpem.br" },
+]
+description = "Equivariant graph neural network interatomic potentials"
+readme = "README.md"
+license = {file = "LICENSE"} # MIT License
+requires-python = ">=3.10"
+dependencies = [
+    'numpy',
+    'ase',
+    'torch>=2.1',
+    'pyyaml',
+    'pytest',
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+
+[project.optional-dependencies]
+#   pip install -e ".[dev]"
+dev = [
+    'pytest-cov',
+    'ruff',
+]
+
+[project.urls]
+"Homepage" = "https://github.com/seixas-research/sagui"
+
+[project.scripts]
+sagui-train = "sagui.cli.train:main"
+sagui-inference = "sagui.cli.inference:main"
+sagui-generate = "sagui.cli.generate:main"
+
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+only-include = [
+    "src/sagui",
+]
+
+[tool.hatch.version]
+path = "src/sagui/version.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E741 forbids `l` as a name. It is *the* symbol for the spherical-harmonic
+# degree throughout the physics literature, and renaming it would make the
+# equivariant code harder to read, not easier.
+ignore = ["E741"]

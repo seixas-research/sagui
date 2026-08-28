@@ -1,0 +1,29 @@
+# Strictly local equivariant potential (Allegro-like): no message passing, so
+# the receptive field stays at exactly one cutoff however deep the model is.
+# Run with:  sagui-train examples/config_strictly_local.yaml
+
+model:
+  type: strictly_local
+  r_max: 5.0
+  lmax: 2
+  channels: 32
+  num_layers: 2         # depth adds body order, NOT receptive field
+  latent_dim: 64        # width of the invariant (scalar) track
+  scalar_mlp_hidden: [64, 64]
+  num_radial_basis: 8
+
+data:
+  train_file: examples/toy.xyz
+  valid_fraction: 0.2
+
+training:
+  epochs: 100
+  batch_size: 8
+  learning_rate: 0.01
+  energy_weight: 1.0
+  forces_weight: 100.0
+  ema_decay: 0.99
+  device: auto
+  default_dtype: float32
+  output_dir: runs
+  name: toy-strictly-local

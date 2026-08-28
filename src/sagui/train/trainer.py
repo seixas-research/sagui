@@ -1,0 +1,258 @@
+"""The training loop behind ``sagui-train``."""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import time
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+
+from ..checkpoint import save_checkpoint
+from ..config import Config
+from ..data.atomic_data import collate_graphs
+from ..data.dataset import AtomsDataset, random_split, read_structures
+from ..data.ztable import ZTable
+from ..models.base import InteratomicPotential
+from ..models.registry import build_model
+from ..utils import count_parameters, resolve_device, resolve_dtype, set_seed
+from .ema import ExponentialMovingAverage
+from .loss import EnergyForcesLoss, compute_metrics
+from .stats import compute_statistics
+
+__all__ = ["run_training", "evaluate"]
+
+logger = logging.getLogger(__name__)
+
+
+def _reduce(totals: dict[str, float]) -> dict[str, float]:
+    """Turn accumulated squared/absolute error sums into MAE and RMSE."""
+    out: dict[str, float] = {}
+    n_struct = totals.get("n_structures", 0.0)
+    n_forces = totals.get("n_force_components", 0.0)
+    if n_struct:
+        if "energy_abs_sum" in totals:
+            out["energy_mae"] = totals["energy_abs_sum"] / n_struct
+            out["energy_rmse"] = math.sqrt(totals["energy_sq_sum"] / n_struct)
+    if n_forces:
+        out["forces_mae"] = totals["forces_abs_sum"] / n_forces
+        out["forces_rmse"] = math.sqrt(totals["forces_sq_sum"] / n_forces)
+    if "loss_sum" in totals and totals.get("n_batches"):
+        out["loss"] = totals["loss_sum"] / totals["n_batches"]
+    return out
+
+
+def evaluate(
+    model: InteratomicPotential,
+    loader: DataLoader,
+    loss_fn: EnergyForcesLoss,
+    device: torch.device,
+) -> dict[str, float]:
+    """Error metrics over a whole loader (no parameter updates)."""
+    model.eval()
+    totals: dict[str, float] = {}
+    for batch in loader:
+        batch = batch.to(device)
+        prediction = model(batch, compute_forces=True, training=False)
+        _, terms = loss_fn(prediction, batch)
+        contributions = compute_metrics(prediction, batch)
+        contributions["loss_sum"] = terms["loss"]
+        contributions["n_batches"] = 1.0
+        for key, value in contributions.items():
+            totals[key] = totals.get(key, 0.0) + value
+    return _reduce(totals)
+
+
+def _train_epoch(
+    model: InteratomicPotential,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: EnergyForcesLoss,
+    device: torch.device,
+    ema: ExponentialMovingAverage | None,
+    max_grad_norm: float | None,
+) -> dict[str, float]:
+    model.train()
+    totals: dict[str, float] = {}
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        prediction = model(batch, compute_forces=True, training=True)
+        loss, terms = loss_fn(prediction, batch)
+        loss.backward()
+        if max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        if ema is not None:
+            ema.update(model)
+
+        contributions = compute_metrics(prediction, batch)
+        contributions["loss_sum"] = terms["loss"]
+        contributions["n_batches"] = 1.0
+        for key, value in contributions.items():
+            totals[key] = totals.get(key, 0.0) + value
+    return _reduce(totals)
+
+
+def _format(prefix: str, metrics: dict[str, float]) -> str:
+    parts = [f"{prefix} loss={metrics.get('loss', float('nan')):.6f}"]
+    if "energy_mae" in metrics:
+        parts.append(f"E-MAE={metrics['energy_mae'] * 1000:.3f} meV/atom")
+    if "forces_mae" in metrics:
+        parts.append(f"F-MAE={metrics['forces_mae'] * 1000:.2f} meV/A")
+    return " | ".join(parts)
+
+
+def run_training(config: Config) -> Path:
+    """Train a model end to end and return the path of the best checkpoint."""
+    training = config.training
+    set_seed(training.seed)
+    dtype = resolve_dtype(training.default_dtype)
+    torch.set_default_dtype(dtype)
+    device = resolve_device(training.device)
+
+    output_dir = Path(training.output_dir) / training.name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config.to_yaml(output_dir / "config.yaml")
+
+    # ------------------------------------------------------------ data
+    if not config.data.train_file:
+        raise ValueError("data.train_file is required")
+    train_frames = read_structures(config.data.train_file)
+    if config.data.valid_file:
+        valid_frames = read_structures(config.data.valid_file)
+    else:
+        train_frames, valid_frames = random_split(
+            train_frames, config.data.valid_fraction, seed=training.seed
+        )
+    logger.info(
+        "loaded %d training and %d validation structures", len(train_frames), len(valid_frames)
+    )
+
+    z_table = ZTable.from_atoms([*train_frames, *valid_frames])
+    logger.info("species: %s", ", ".join(z_table.symbols))
+
+    dataset_kwargs = dict(
+        z_table=z_table,
+        r_max=config.model.r_max,
+        energy_key=config.data.energy_key,
+        forces_key=config.data.forces_key,
+        dtype=dtype,
+        cache=config.data.cache_graphs,
+    )
+    train_set = AtomsDataset(train_frames, **dataset_kwargs)
+    valid_set = AtomsDataset(valid_frames, **dataset_kwargs) if valid_frames else None
+
+    stats = compute_statistics(train_set, fit_atomic_energies=training.fit_atomic_energies)
+    logger.info("%r", stats)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=training.batch_size,
+        shuffle=True,
+        collate_fn=collate_graphs,
+        num_workers=config.data.num_workers,
+        drop_last=False,
+    )
+    valid_loader = (
+        DataLoader(
+            valid_set,
+            batch_size=training.valid_batch_size or training.batch_size,
+            shuffle=False,
+            collate_fn=collate_graphs,
+            num_workers=config.data.num_workers,
+        )
+        if valid_set is not None and len(valid_set) > 0
+        else None
+    )
+
+    # ----------------------------------------------------------- model
+    model = build_model(
+        config.model,
+        atomic_numbers=z_table.zs,
+        atomic_energies=stats.atomic_energies,
+        energy_scale=stats.energy_scale,
+        avg_num_neighbors=stats.avg_num_neighbors,
+    ).to(device)
+    logger.info(
+        "architecture '%s' with %d trainable parameters",
+        config.model.type,
+        count_parameters(model),
+    )
+
+    loss_fn = EnergyForcesLoss(training.energy_weight, training.forces_weight)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=training.lr_factor,
+        patience=training.lr_patience,
+        min_lr=training.min_lr,
+    )
+    ema = (
+        ExponentialMovingAverage(model, training.ema_decay)
+        if training.ema_decay is not None
+        else None
+    )
+
+    # ------------------------------------------------------------ loop
+    history: list[dict[str, float]] = []
+    best_loss = float("inf")
+    best_path = output_dir / "best.model"
+    last_path = output_dir / "last.model"
+    started = time.time()
+
+    for epoch in range(1, training.epochs + 1):
+        train_metrics = _train_epoch(
+            model, train_loader, optimizer, loss_fn, device, ema, training.max_grad_norm
+        )
+
+        if valid_loader is not None:
+            if ema is not None:
+                with ema.average_parameters(model):
+                    valid_metrics = evaluate(model, valid_loader, loss_fn, device)
+            else:
+                valid_metrics = evaluate(model, valid_loader, loss_fn, device)
+            monitored = valid_metrics.get("loss", train_metrics.get("loss", float("inf")))
+        else:
+            valid_metrics = {}
+            monitored = train_metrics.get("loss", float("inf"))
+        scheduler.step(monitored)
+
+        record = {
+            "epoch": epoch,
+            "lr": optimizer.param_groups[0]["lr"],
+            **{f"train_{k}": v for k, v in train_metrics.items()},
+            **{f"valid_{k}": v for k, v in valid_metrics.items()},
+        }
+        history.append(record)
+        if epoch % max(1, training.log_every) == 0 or epoch == training.epochs:
+            message = f"epoch {epoch:4d}/{training.epochs} | " + _format("train", train_metrics)
+            if valid_metrics:
+                message += " || " + _format("valid", valid_metrics)
+            logger.info(message)
+
+        weights = ema.shadow if ema is not None else None
+        save_checkpoint(
+            last_path, model, config, z_table, stats, epoch=epoch, metrics=record,
+            state_dict=weights,
+        )
+        if monitored < best_loss:
+            best_loss = monitored
+            save_checkpoint(
+                best_path, model, config, z_table, stats, epoch=epoch, metrics=record,
+                state_dict=weights,
+            )
+
+    with (output_dir / "history.json").open("w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2)
+
+    elapsed = time.time() - started
+    logger.info("training finished in %.1f s; best objective %.6f", elapsed, best_loss)
+    logger.info("best model: %s", best_path)
+    return best_path

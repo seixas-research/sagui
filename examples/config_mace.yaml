@@ -1,0 +1,28 @@
+# Message-passing equivariant potential (MACE-like).
+# Run with:  sagui-train examples/config_mace.yaml
+
+model:
+  type: mace            # message passing with a many-body (ACE) basis
+  r_max: 5.0            # cutoff radius in Angstrom
+  lmax: 2               # feature degrees kept: 0e + 1o + 2e
+  channels: 32          # channels per degree
+  num_layers: 2         # each layer widens the receptive field by r_max
+  correlation: 3        # up to 4-body terms inside every layer
+  num_radial_basis: 8
+  radial_mlp_hidden: [64, 64]
+
+data:
+  train_file: examples/toy.xyz
+  valid_fraction: 0.2
+
+training:
+  epochs: 100
+  batch_size: 8
+  learning_rate: 0.01
+  energy_weight: 1.0
+  forces_weight: 100.0
+  ema_decay: 0.99
+  device: auto
+  default_dtype: float32
+  output_dir: runs
+  name: toy-mace

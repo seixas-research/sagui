@@ -1,0 +1,43 @@
+# Generative model of crystal structures: D3PM over atom types, wrapped-normal
+# diffusion over fractional coordinates, and DDPM over the lattice.
+#
+#   python examples/make_toy_crystals.py --output examples/crystals.xyz
+#   sagui-train examples/config_generative.yaml
+#   sagui-generate --model runs/toy-d3pm/best.model -n 16 -o generated.xyz
+#
+# Note the training data must be 3D-periodic: the model generates a lattice.
+
+task: generative
+
+model:                  # the denoiser backbone (message passing)
+  type: mace
+  r_max: 5.0
+  lmax: 2               # l=1 carries the coordinate score, l=2 the lattice
+  channels: 32
+  num_layers: 3
+  correlation: 2
+  num_radial_basis: 8
+
+diffusion:
+  num_steps: 500        # sampling cost is linear in this
+  type_transition: absorbing   # BERT-like unmasking; 'uniform' is the alternative
+  sigma_min: 0.005      # fractional coordinate noise ladder
+  sigma_max: 0.5        # 1.0 would already be uniform over the cell
+  type_weight: 1.0
+  coord_weight: 1.0
+  lattice_weight: 1.0
+  rotation_augmentation: true  # keeps the lattice process rotation-covariant
+
+data:
+  train_file: examples/crystals.xyz
+  valid_fraction: 0.1
+
+training:
+  epochs: 300
+  batch_size: 16
+  learning_rate: 0.005
+  ema_decay: 0.99
+  device: auto
+  default_dtype: float32
+  output_dir: runs
+  name: toy-d3pm
