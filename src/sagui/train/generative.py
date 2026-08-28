@@ -27,7 +27,7 @@ from ..data.ztable import ZTable
 from ..generative.dataset import DiffusionDataset, collate_diffusion
 from ..generative.diffusion import MaterialsDiffusion
 from ..generative.structures import graph_from_arrays, lattice_length_scale
-from ..utils import count_parameters, resolve_device, resolve_dtype, set_seed
+from ..utils import clip_gradients, count_parameters, resolve_device_and_dtype, set_seed
 from .ema import ExponentialMovingAverage
 
 __all__ = ["run_diffusion_training", "compute_generative_statistics", "evaluate_diffusion"]
@@ -86,7 +86,7 @@ def _run_epoch(
     training = optimizer is not None
     model.train(training)
     totals: dict[str, float] = {}
-    batches = 0
+    batches = skipped = 0
 
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
@@ -96,14 +96,25 @@ def _run_epoch(
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                if max_grad_norm:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                if not torch.isfinite(clip_gradients(model, max_grad_norm)):
+                    # See sagui.utils.clip_gradients: stepping here would turn
+                    # every parameter, and the EMA, into NaN for good.
+                    skipped += 1
+                    continue
                 optimizer.step()
                 if ema is not None:
                     ema.update(model)
             for key, value in terms.items():
                 totals[key] = totals.get(key, 0.0) + value
             batches += 1
+
+    if skipped:
+        if not batches:
+            raise RuntimeError(
+                f"every one of the {skipped} batches in this epoch produced a non-finite "
+                "gradient; training has diverged"
+            )
+        logger.warning("skipped %d batch(es) with non-finite gradients this epoch", skipped)
     return {key: value / max(batches, 1) for key, value in totals.items()}
 
 
@@ -132,9 +143,8 @@ def run_diffusion_training(config: Config) -> Path:
     """Train a generative diffusion model; returns the best checkpoint path."""
     training = config.training
     set_seed(training.seed)
-    dtype = resolve_dtype(training.default_dtype)
+    device, dtype = resolve_device_and_dtype(training.device, training.default_dtype)
     torch.set_default_dtype(dtype)
-    device = resolve_device(training.device)
 
     output_dir = Path(training.output_dir) / training.name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,6 +159,7 @@ def run_diffusion_training(config: Config) -> Path:
         train_frames, valid_frames = random_split(
             frames, config.data.valid_fraction, seed=training.seed
         )
+    logger.info("training on %s in %s", device, str(dtype).replace("torch.", ""))
     logger.info(
         "loaded %d training and %d validation structures", len(train_frames), len(valid_frames)
     )
@@ -177,6 +188,8 @@ def run_diffusion_training(config: Config) -> Path:
 
     dataset_kwargs = dict(
         z_table=z_table,
+        # DiffusionDataset keeps its own CPU copy: the model's buffers are on
+        # the accelerator, while corruption runs on CPU in the loader workers.
         corruption=model.corruption,
         r_max=config.model.r_max,
         lattice_scale=stats.lattice_scale,

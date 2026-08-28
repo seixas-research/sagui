@@ -51,8 +51,16 @@ def sanitize_lattice(
 
     Works on a single ``[3, 3]`` matrix or a batch ``[..., 3, 3]``.
     """
-    lattice = torch.nan_to_num(lattice, nan=0.0, posinf=max_length, neginf=-max_length)
-    u, s, vh = torch.linalg.svd(lattice.to(torch.float64))
+    device, dtype = lattice.device, lattice.dtype
+    # The decomposition runs on the CPU in float64: it wants the precision, and
+    # Metal has no float64 at all (its SVD would silently fall back to the CPU
+    # anyway).  This is a handful of 3x3 matrices, so the round trip is free.
+    work = torch.nan_to_num(lattice, nan=0.0, posinf=max_length, neginf=-max_length)
+    # Move *then* cast: a combined .to(device=..., dtype=float64) is performed on
+    # the source device, and Metal refuses float64 before the transfer happens.
+    work = work.to("cpu").to(torch.float64)
+
+    u, s, vh = torch.linalg.svd(work)
     s = s.clamp(float(min_length), float(max_length))
     out = (u * s.unsqueeze(-2)) @ vh
     negative = torch.linalg.det(out) < 0
@@ -60,7 +68,7 @@ def sanitize_lattice(
         flipped = out.clone()
         flipped[..., 0, :] = -flipped[..., 0, :]
         out = torch.where(negative[..., None, None], flipped, out)
-    return out.to(lattice.dtype)
+    return out.to(device=device, dtype=dtype)
 
 
 def _truncate_neighbors(

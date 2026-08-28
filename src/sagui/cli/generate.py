@@ -15,7 +15,7 @@ from ase.io import write
 
 from ..checkpoint import load_generative_model
 from ..generative.diffusion import GeneratedStructure
-from ..utils import resolve_device, resolve_dtype, set_seed, setup_logging
+from ..utils import resolve_device_and_dtype, set_seed, setup_logging
 from ..version import __version__
 
 __all__ = ["main", "build_parser", "to_atoms"]
@@ -80,9 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(getattr(logging, args.log_level))
     set_seed(args.seed)
 
-    dtype = resolve_dtype(args.default_dtype)
+    device, dtype = resolve_device_and_dtype(args.device, args.default_dtype)
     torch.set_default_dtype(dtype)
-    device = resolve_device(args.device)
+    logger.info("running on %s in %s", device, str(dtype).replace("torch.", ""))
 
     model, config, z_table, stats = load_generative_model(args.model, device=device, dtype=dtype)
     logger.info(

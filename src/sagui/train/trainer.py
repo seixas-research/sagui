@@ -18,7 +18,7 @@ from ..data.dataset import AtomsDataset, random_split, read_structures
 from ..data.ztable import ZTable
 from ..models.base import InteratomicPotential
 from ..models.registry import build_model
-from ..utils import count_parameters, resolve_device, resolve_dtype, set_seed
+from ..utils import clip_gradients, count_parameters, resolve_device_and_dtype, set_seed
 from .ema import ExponentialMovingAverage
 from .loss import EnergyForcesLoss, compute_metrics
 from .stats import compute_statistics
@@ -77,14 +77,19 @@ def _train_epoch(
 ) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
+    skipped = 0
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
         prediction = model(batch, compute_forces=True, training=True)
         loss, terms = loss_fn(prediction, batch)
         loss.backward()
-        if max_grad_norm:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+        if not torch.isfinite(clip_gradients(model, max_grad_norm)):
+            # Stepping on a non-finite gradient would poison every parameter
+            # (and the EMA) permanently.  Drop the batch and carry on.
+            skipped += 1
+            continue
         optimizer.step()
         if ema is not None:
             ema.update(model)
@@ -94,6 +99,17 @@ def _train_epoch(
         contributions["n_batches"] = 1.0
         for key, value in contributions.items():
             totals[key] = totals.get(key, 0.0) + value
+
+    if skipped:
+        if not totals:
+            raise RuntimeError(
+                f"every one of the {skipped} batches in this epoch produced a non-finite "
+                "gradient; training has diverged (try a smaller learning rate, "
+                "float64, or a smaller max_grad_norm)"
+            )
+        logger.warning(
+            "skipped %d batch(es) with non-finite gradients this epoch", skipped
+        )
     return _reduce(totals)
 
 
@@ -110,9 +126,8 @@ def run_training(config: Config) -> Path:
     """Train a model end to end and return the path of the best checkpoint."""
     training = config.training
     set_seed(training.seed)
-    dtype = resolve_dtype(training.default_dtype)
+    device, dtype = resolve_device_and_dtype(training.device, training.default_dtype)
     torch.set_default_dtype(dtype)
-    device = resolve_device(training.device)
 
     output_dir = Path(training.output_dir) / training.name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -128,6 +143,7 @@ def run_training(config: Config) -> Path:
         train_frames, valid_frames = random_split(
             train_frames, config.data.valid_fraction, seed=training.seed
         )
+    logger.info("training on %s in %s", device, str(dtype).replace("torch.", ""))
     logger.info(
         "loaded %d training and %d validation structures", len(train_frames), len(valid_frames)
     )

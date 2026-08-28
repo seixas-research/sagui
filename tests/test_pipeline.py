@@ -39,6 +39,9 @@ def _train(tmp_path, frames, **overrides) -> tuple[Config, str]:
     config.training.epochs = 2
     config.training.batch_size = 4
     config.training.default_dtype = "float64"
+    # float64 for tight tolerances, hence CPU: Metal has no double precision.
+    # Per-device coverage lives in test_devices.py.
+    config.training.device = "cpu"
     config.training.output_dir = str(tmp_path / "runs")
     config.training.name = "test"
     for key, value in overrides.items():
@@ -82,7 +85,7 @@ def test_calculator_matches_the_model_and_drives_ase(tmp_path, labelled_frames):
     best = run_training(config)
 
     atoms = labelled_frames[0].copy()
-    atoms.calc = SaguiCalculator(best, default_dtype="float64")
+    atoms.calc = SaguiCalculator(best, default_dtype="float64", device="cpu")
     energy = atoms.get_potential_energy()
     forces = atoms.get_forces()
 
@@ -93,7 +96,7 @@ def test_calculator_matches_the_model_and_drives_ase(tmp_path, labelled_frames):
     # graph from scratch every call, so this checks that path too.
     moved = atoms.copy()
     moved.positions += np.array([1.3, -0.7, 2.2])
-    moved.calc = SaguiCalculator(best, default_dtype="float64")
+    moved.calc = SaguiCalculator(best, default_dtype="float64", device="cpu")
     assert np.isclose(moved.get_potential_energy(), energy, atol=1e-8)
 
 
@@ -106,7 +109,7 @@ def test_calculator_reports_unknown_elements(tmp_path, labelled_frames):
     best = run_training(config)
 
     gold = Atoms("Au2", positions=[[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]])
-    gold.calc = SaguiCalculator(best, default_dtype="float64")
+    gold.calc = SaguiCalculator(best, default_dtype="float64", device="cpu")
     with pytest.raises(KeyError, match="unknown to this model"):
         gold.get_potential_energy()
 
@@ -123,7 +126,7 @@ def test_train_and_inference_command_lines(tmp_path, labelled_frames, capsys):
             "--model-type", "strictly_local",
             "--epochs", "2", "--batch-size", "4", "--channels", "8", "--lmax", "1",
             "--num-layers", "1", "--r-max", "5.0",
-            "--default-dtype", "float64",
+            "--default-dtype", "float64", "--device", "cpu",
             "--output-dir", str(runs), "--name", "cli",
             "--set", "model.latent_dim=16",
             "--set", "model.scalar_mlp_hidden=[16]",
@@ -169,7 +172,7 @@ def test_generative_train_and_sample_command_lines(tmp_path, crystal, capsys):
             "--task", "generative",
             "--train-file", str(data_file),
             "--epochs", "2", "--batch-size", "3", "--channels", "8", "--lmax", "2",
-            "--num-layers", "1", "--r-max", "4.0", "--default-dtype", "float64",
+            "--num-layers", "1", "--r-max", "4.0", "--default-dtype", "float64", "--device", "cpu",
             "--output-dir", str(runs), "--name", "gen",
             "--set", "diffusion.num_steps=20",
             "--set", "model.radial_mlp_hidden=[16]",
@@ -193,7 +196,7 @@ def test_generative_train_and_sample_command_lines(tmp_path, crystal, capsys):
     assert generate_cli.main(
         [
             "--model", str(checkpoint), "-n", "2", "--steps", "20",
-            "--output", str(output), "--default-dtype", "float64",
+            "--output", str(output), "--default-dtype", "float64", "--device", "cpu",
             "--log-level", "WARNING",
         ]
     ) == 0

@@ -12,6 +12,7 @@ training step is a plain forward pass with no further randomness.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from typing import Any
@@ -53,6 +54,10 @@ class DiffusionBatch:
         return self.graph.num_graphs
 
 
+def _is_on_cpu(module: torch.nn.Module) -> bool:
+    return all(buffer.device.type == "cpu" for buffer in module.buffers())
+
+
 def random_rotation(generator: np.random.Generator) -> np.ndarray:
     """A uniformly distributed proper rotation (QR of a Gaussian matrix)."""
     q, r = np.linalg.qr(generator.normal(size=(3, 3)))
@@ -85,7 +90,14 @@ class DiffusionDataset(Dataset):
                     "diffuses a lattice and therefore needs 3D-periodic cells"
                 )
         self.z_table = z_table
-        self.corruption = corruption
+        # Corruption happens here, on CPU tensors, possibly inside a data-loader
+        # worker -- but the caller usually hands us the *model's* module, whose
+        # buffers followed the model onto the GPU.  Indexing a CUDA/MPS buffer
+        # with CPU indices raises, so keep a private CPU copy.  The buffers are
+        # deterministic functions of the configuration, so the copy is exact.
+        self.corruption = (
+            corruption if _is_on_cpu(corruption) else copy.deepcopy(corruption).to("cpu")
+        )
         self.r_max = float(r_max)
         self.lattice_scale = float(lattice_scale)
         self.max_neighbors = int(max_neighbors)

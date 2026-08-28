@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from ..checkpoint import load_model
 from ..data.atomic_data import collate_graphs, extract_labels
 from ..data.dataset import AtomsDataset, read_structures
-from ..utils import resolve_device, resolve_dtype, setup_logging
+from ..utils import resolve_device_and_dtype, setup_logging
 from ..version import __version__
 
 __all__ = ["main", "build_parser"]
@@ -66,9 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(getattr(logging, args.log_level))
 
-    dtype = resolve_dtype(args.default_dtype)
+    device, dtype = resolve_device_and_dtype(args.device, args.default_dtype)
     torch.set_default_dtype(dtype)
-    device = resolve_device(args.device)
+    logger.info("running on %s in %s", device, str(dtype).replace("torch.", ""))
 
     model, config, z_table = load_model(args.model, device=device, dtype=dtype)
     logger.info(

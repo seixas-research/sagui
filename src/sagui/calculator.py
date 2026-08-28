@@ -21,7 +21,7 @@ from .checkpoint import load_model
 from .data.atomic_data import collate_graphs, graph_from_atoms
 from .data.ztable import ZTable
 from .models.base import InteratomicPotential
-from .utils import resolve_device, resolve_dtype
+from .utils import resolve_device_and_dtype
 
 __all__ = ["SaguiCalculator"]
 
@@ -49,11 +49,13 @@ class SaguiCalculator(Calculator):
             ``"auto"``, ``"cpu"``, ``"cuda"``, ...
         default_dtype:
             ``float64`` by default: dynamics is sensitive to the noise floor of
-            single precision, and inference is rarely the bottleneck.
+            single precision, and inference is rarely the bottleneck.  Metal has
+            no ``float64``, so on MPS this is downgraded to ``float32`` with a
+            warning -- pass ``device="cpu"`` if the precision matters more than
+            the throughput.
         """
         super().__init__(**kwargs)
-        self.device = resolve_device(device)
-        self.dtype = resolve_dtype(default_dtype)
+        self.device, self.dtype = resolve_device_and_dtype(device, default_dtype)
 
         if model is None:
             raise ValueError("a model path or an InteratomicPotential instance is required")

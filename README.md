@@ -86,6 +86,57 @@ The generative model diffuses the three parts of a crystal jointly:
 - **fractional coordinates** with a *wrapped* normal on the unit torus;
 - **the lattice** with a standard DDPM, in units of the mean interatomic distance.
 
+## Devices
+
+`--device auto` (the default) picks **CUDA, then Apple MPS, then CPU**. All
+three run the full pipeline: forward, force training (which needs a second
+derivative through the whole network), checkpointing, the ASE calculator, and
+diffusion sampling.
+
+```bash
+sagui-train  config.yaml --device auto     # cuda > mps > cpu
+sagui-train  config.yaml --device mps      # force a specific backend
+sagui-inference --model best.model --input x.xyz --device cpu
+```
+
+One caveat is worth knowing: **Metal has no `float64` at all.** Asking for
+double precision on MPS logs a warning and falls back to `float32` rather than
+failing inside a forward pass. Use `--device cpu` when the precision is what
+matters — finite-difference checks, tight relaxations, or comparing energies at
+the micro-eV level.
+
+MPS is not automatically *faster*: for the model sizes here the per-kernel
+launch overhead roughly cancels the parallelism, and CPU and MPS come out
+within ~10 % of each other. Measure before assuming.
+
+Verified on MPtrj (500 real DFT frames, 81 elements) by training each
+architecture on each backend and then running one CPU-trained checkpoint on
+both — the two devices agree to float32 round-off:
+
+| architecture | max abs energy difference | max abs force difference |
+|---|---|---|
+| `mace` | 3.8e-06 eV (1.1e-07 relative) | 1.9e-08 eV/Å |
+| `strictly_local` | 0 eV | 8.6e-08 eV/Å |
+
+## Training on MPtrj
+
+`examples/mptrj_to_xyz.py` streams the Materials Project trajectory dataset
+(~1.6 M DFT frames, shipped as one ~11 GB JSON object that cannot be loaded
+into memory) and extracts a portion as extended XYZ:
+
+```bash
+python examples/mptrj_to_xyz.py \
+    --input /path/to/MPtrj_2022.9_full.json \
+    --output mptrj_2k.xyz --limit 2000 --max-atoms 40
+
+sagui-train --train-file mptrj_2k.xyz --model-type mace --r-max 5.0
+```
+
+It keeps a bounded buffer and stops as soon as it has enough frames, so
+reading a few thousand takes seconds. `--elements` restricts to a chemical
+subsystem, `--frames-per-material` trades correlated relaxation frames for
+diversity.
+
 ## Configuration
 
 One YAML file describes a run; every key can be overridden from the command
