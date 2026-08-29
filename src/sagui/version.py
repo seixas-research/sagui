@@ -1,3 +1,3 @@
 """Single source of truth for the package version."""
 
-__version__ = "26.8.2"
+__version__ = "26.8.3"

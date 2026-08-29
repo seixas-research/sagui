@@ -219,6 +219,8 @@ __marimo__/
 
 # SAGUI internal design document (kept out of version control)
 sagui_context.md
+sagui_quality_improvements.md
+
 
 # Training artefacts
 runs/
@@ -228,3 +230,15 @@ runs/
 
 # CLAUDE
 CLAUDE.md
+
+# LaTeX build artefacts (latex/)
+latex/
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.toc
+
