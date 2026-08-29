@@ -233,6 +233,79 @@ def test_strictly_local_receptive_field_is_one_cutoff():
     assert _energy_response_of_atom_zero(model, z_table, 1.0) < 1e-14
 
 
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_atomic_energy_resolves_bond_angles(architecture):
+    """``E_i`` must depend on the angles at *i*, not only on the distances to
+    its neighbours.
+
+    This is the test that separates a genuine many-body potential from a radial
+    descriptor network, and the only one in this file that does: an
+    angle-blind model satisfies every symmetry and conservation check here
+    perfectly, because invariance under rotation is exactly what it has in
+    abundance.  ``strictly_local`` failed this before it gained the equivariant
+    environment tensor, with a response of *zero* to machine precision.
+    """
+    z_table = ZTable([8])
+    model = make_model(architecture, z_table, num_layers=2)
+
+    energies = []
+    for theta in (0.6, 1.2, 2.0):
+        # Three neighbours, all at 1.9 A from atom 0: every r_0k is the same in
+        # all three geometries and only the angles subtended at atom 0 differ.
+        positions = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.9, 0.0, 0.0],
+                [0.0, 1.9, 0.0],
+                [1.9 * np.cos(theta), 0.0, 1.9 * np.sin(theta)],
+            ]
+        )
+        atoms = Atoms(numbers=[8] * 4, positions=positions, cell=np.eye(3) * 30.0, pbc=False)
+        energies.append(float(predict(model, atoms, z_table)["node_energy"][0]))
+
+    assert max(energies) - min(energies) > 1e-8
+
+
+def test_strictly_local_is_angle_blind_without_the_environment_tensor():
+    """Pin the failure mode the flag exists to reproduce.
+
+    Coupling ``V_ij`` against the edge's own harmonic keeps it proportional to
+    ``Y(rhat_ij)`` at every depth, so every invariant read out of it is a
+    constant and the atomic energy collapses to a function of the distances.
+    """
+    z_table = ZTable([8])
+    model = make_model(
+        "strictly_local", z_table, environment_tensor=False, refresh_environment=False
+    )
+
+    energies = []
+    for theta in (0.6, 1.2, 2.0):
+        positions = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.9, 0.0, 0.0],
+                [0.0, 1.9, 0.0],
+                [1.9 * np.cos(theta), 0.0, 1.9 * np.sin(theta)],
+            ]
+        )
+        atoms = Atoms(numbers=[8] * 4, positions=positions, cell=np.eye(3) * 30.0, pbc=False)
+        energies.append(float(predict(model, atoms, z_table)["node_energy"][0]))
+
+    assert max(energies) - min(energies) < 1e-14
+
+
+def test_environment_tensor_leaves_the_receptive_field_alone():
+    """The fix aggregates over N(i), so it buys angular resolution for free.
+
+    Guards the one way this change could have gone wrong: aggregating over the
+    neighbours of *j* instead of *i* would also fix the angles, and would
+    silently turn the model into a message-passing one.
+    """
+    z_table = ZTable([1])
+    model = make_model("strictly_local", z_table, num_layers=3, environment_tensor=True)
+    assert _energy_response_of_atom_zero(model, z_table, 1.0) < 1e-14
+
+
 def test_message_passing_reaches_beyond_one_cutoff():
     """The counterpart: two MACE layers propagate information two cutoffs, so
     the same displacement does move the central atom's energy."""

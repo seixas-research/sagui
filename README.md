@@ -30,7 +30,8 @@ dependency**.
 
 ```bash
 conda activate sagui
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # development
+pip install -e ".[fast]"         # optional: vesin, for fast neighbour lists
 ```
 
 Requires Python ≥ 3.10. Installing provides three commands: `sagui-train`,
@@ -137,6 +138,68 @@ reading a few thousand takes seconds. `--elements` restricts to a chemical
 subsystem, `--frames-per-material` trades correlated relaxation frames for
 diversity.
 
+## Angular resolution
+
+`strictly_local` couples its edge tensor against an **aggregated equivariant
+environment tensor** (Allegro's environment embedding), not against the edge's own
+spherical harmonic. This is not a tuning choice. Coupling against `Y(r̂_ij)` alone
+keeps `V_ij` proportional to `Y(r̂_ij)` at every depth, so every rotation invariant
+read out of it is a constant and the atomic energy collapses to a function of the
+*distances* `{(Z_k, r_ik)}` — the model becomes exactly blind to bond angles.
+
+Two config keys control it, both on by default:
+
+| key | effect |
+| --- | --- |
+| `model.environment_tensor` | couple against `Ŷ_i = Σ_k u(r_ik) g(x_ik) Y(r̂_ik)` instead of `Y(r̂_ij)` |
+| `model.refresh_environment` | rebuild the invariant descriptor `e_i` at every layer |
+
+Both sums run over `N(i)` only, so the receptive field stays at exactly one cutoff
+— `test_environment_tensor_leaves_the_receptive_field_alone` pins that. Set either
+to `false` only to reproduce the pre-fix architecture for comparison.
+
+> A symmetry test suite cannot catch this failure: rotational invariance is exactly
+> what an angle-blind model has in abundance. It must be tested for directly, which
+> `test_atomic_energy_resolves_bond_angles` does.
+
+On a reference potential whose force variance is 41 % three-body, the fix is worth
+**9.3× on energy MAE and 2.6× on force MAE** (mean over 3 seeds), for 1.13× the
+runtime and 1.17× the parameters.
+
+## Inference speed
+
+Two settings matter for molecular dynamics, both measured on a 216-atom Si cell
+(6 048 edges, `lmax=2`, `C=32`, 2 layers, CPU float32, energy **and** forces):
+
+| configuration | neighbour list | model | step | speed-up |
+| --- | --- | --- | --- | --- |
+| ASE list, `tensor_product: loop`, eager | 5.15 ms | 233.7 ms | 238.9 ms | 1.00× |
+| + `vesin` neighbour list | 0.22 ms | 233.7 ms | 233.9 ms | 1.02× |
+| + `tensor_product: gemm` *(the default)* | 0.22 ms | 214.5 ms | 214.7 ms | 1.11× |
+| + `model.compile_layers()` | 0.22 ms | 105.2 ms | 105.5 ms | **2.27×** |
+
+- **`model.tensor_product`** selects how the Clebsch–Gordan product is scheduled.
+  `gemm` (the default) evaluates every coupling path in one fused matrix product;
+  `loop` is the reference implementation, one `einsum` per path, kept because it
+  uses less peak memory and because the fused kernel is tested against it. The two
+  compute the same function and share the same parameters, so checkpoints are
+  portable between them.
+- **`compile_layers()`** hands the layers to `torch.compile`. It is opt-in: warm-up
+  costs tens of seconds, and the compiled *backward* has been observed to fail on
+  large systems, so benchmark it at your own system size before relying on it.
+
+```python
+calc = SaguiCalculator(model="best.model", compile_layers=True)
+```
+
+```bash
+sagui-inference --model best.model --input material.xyz --compile
+```
+
+Installing `vesin` (`pip install -e ".[fast]"`) is transparent: the neighbour list
+is 36–67× faster and returns the same edges, and SAGUI falls back to ASE when it
+is absent or when the cell is only partly periodic.
+
 ## Configuration
 
 One YAML file describes a run; every key can be overridden from the command
@@ -226,12 +289,6 @@ rotation, reflection, translation and permutation equivariance to machine
 precision; forces against central finite differences; size extensivity of a
 supercell; the receptive field of each architecture; and the exactness of the
 D3PM transition matrices and the wrapped-normal score.
-
-## Status
-
-Early but functional: both architectures train and converge, and the
-generative model trains and samples. See `sagui_context.md` (not tracked in
-git) for the design rationale and the roadmap.
 
 ## License
 

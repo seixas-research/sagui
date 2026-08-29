@@ -7,9 +7,11 @@ both supported architectures:
 ``EquivariantLinear``
     mixes channels *within* a degree -- the only linear map that commutes with
     rotations (Schur's lemma);
-``WeightedTensorProduct`` / ``SelfTensorProduct``
+``WeightedTensorProduct`` / ``GemmWeightedTensorProduct`` / ``SelfTensorProduct``
     couple two equivariant tensors through the invariant Clebsch-Gordan
-    tensors, the only source of *equivariant* nonlinearity;
+    tensors, the only source of *equivariant* nonlinearity.  The first two are
+    mathematically identical and differ only in how the contraction is
+    scheduled -- see :func:`build_weighted_tensor_product`;
 ``invariant_features``
     reads rotation invariants back out so that ordinary MLPs can act on them.
 
@@ -34,7 +36,10 @@ __all__ = [
     "EquivariantLinear",
     "SpeciesLinear",
     "WeightedTensorProduct",
+    "GemmWeightedTensorProduct",
     "SelfTensorProduct",
+    "TENSOR_PRODUCT_KINDS",
+    "build_weighted_tensor_product",
     "invariant_features",
     "num_invariants",
     "scalars",
@@ -184,7 +189,7 @@ class _TensorProductBase(nn.Module):
 
 
 class WeightedTensorProduct(_TensorProductBase):
-    r"""Couple features with spherical harmonics using per-edge weights.
+    r"""Couple features with a second equivariant operand using per-edge weights.
 
     .. math::
         (x \otimes_w Y)^{(l_3)}_{c,k} = \sum_{\text{paths}} w_{p,c}\,
@@ -197,21 +202,160 @@ class WeightedTensorProduct(_TensorProductBase):
     spherical harmonic -- the general form of an equivariant kernel.
     """
 
-    def forward(self, x: torch.Tensor, sh: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        """``x``: ``[E, C, D1]``, ``sh``: ``[E, D2]``, ``weights``: ``[E, P, C]``."""
+    def forward(self, x: torch.Tensor, y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """``x``: ``[E, C, D1]``; ``y``: ``[E, D2]`` or ``[E, C, D2]``; ``w``: ``[E, P, C]``."""
         if weights.shape[1] != self.num_paths:
             raise ValueError(f"expected {self.num_paths} path weights, got {weights.shape[1]}")
+        # A channel-less second operand is the spherical harmonic of a single
+        # edge; a channelled one is an aggregated environment tensor.
+        equation = "eci,ecj,ijk->eck" if y.dim() == 3 else "eci,ej,ijk->eck"
         contributions: list[torch.Tensor | None] = [None] * (self.lmax_out + 1)
         for k, (l1, l2, l3) in enumerate(self.paths):
             term = torch.einsum(
-                "eci,ej,ijk->eck",
+                equation,
                 x[..., SphericalLayout.block(l1)],
-                sh[..., SphericalLayout.block(l2)],
+                y[..., SphericalLayout.block(l2)],
                 self._w3j(k),
             )
             term = term * weights[:, k, :].unsqueeze(-1) * self.path_norms[k]
             contributions[l3] = term if contributions[l3] is None else contributions[l3] + term
         return self._gather(contributions, x)
+
+
+class GemmWeightedTensorProduct(_TensorProductBase):
+    r"""Single-GEMM evaluation of :class:`WeightedTensorProduct`.
+
+    Mathematically identical to the path loop -- the two agree to ~5e-15 in
+    double precision -- but scheduled as one dense contraction instead of one
+    ``einsum`` per coupling path.  The loop is dispatch-bound rather than
+    FLOP-bound: profiling a 216-atom cell put it at 75% of the layer's forward
+    time while performing 6% of its arithmetic, running at ~0.9 GFLOP/s beside
+    scalar MLPs reaching ~200 GFLOP/s.
+
+    The reformulation writes the outer product of the two operands once,
+
+    .. math:: z_{c,(ij)} = x^{}_{c,i}\, y^{}_{c,j},
+
+    and then observes that the Clebsch-Gordan contraction is a *constant*
+    matrix acting on the combined ``(i, j)`` axis, so every path is evaluated
+    by a single ``[E C, D_1 D_2] x [D_1 D_2, S]`` matrix product with
+    :math:`S = \sum_p (2 l_3 + 1)`.  Applying the per-edge path weights and
+    summing the columns into their output degrees finishes the job in five
+    kernels.
+
+    The second operand may carry a channel axis or not, so this class also
+    serves products against an aggregated (per-atom) equivariant tensor.
+
+    Memory
+    ------
+    The intermediate ``z`` holds ``E * channels * D_1 * D_2`` elements.  To keep
+    that bounded on large systems the edge axis is processed in chunks sized so
+    the intermediate stays under :attr:`INTERMEDIATE_BUDGET` elements; pass
+    ``chunk_edges`` to override, or a value larger than ``E`` to disable
+    chunking entirely.
+    """
+
+    #: Element budget for the ``z`` intermediate (2**26 ~ 256 MB in float32).
+    INTERMEDIATE_BUDGET = 1 << 26
+
+    def __init__(
+        self,
+        lmax_in1: int,
+        lmax_in2: int,
+        lmax_out: int,
+        channels: int | None = None,
+        chunk_edges: int | None = None,
+    ) -> None:
+        super().__init__(lmax_in1, lmax_in2, lmax_out)
+        d1 = (self.lmax_in1 + 1) ** 2
+        d2 = (self.lmax_in2 + 1) ** 2
+        d3 = (self.lmax_out + 1) ** 2
+
+        # cg[(i, j), column] gathers every path into one constant matrix; the
+        # column bookkeeping records which path weight and which output degree
+        # each column belongs to.
+        n_cols = sum(2 * l3 + 1 for _, _, l3 in self.paths)
+        cg = torch.zeros(d1 * d2, n_cols, dtype=torch.get_default_dtype())
+        col_path: list[int] = []
+        col_out: list[int] = []
+        column = 0
+        for k, (l1, l2, l3) in enumerate(self.paths):
+            w3j = self._w3j(k) * self.path_norms[k]
+            for m in range(2 * l3 + 1):
+                block = torch.zeros(d1, d2, dtype=cg.dtype)
+                block[l1 * l1 : (l1 + 1) ** 2, l2 * l2 : (l2 + 1) ** 2] = w3j[:, :, m]
+                cg[:, column] = block.reshape(-1)
+                col_path.append(k)
+                col_out.append(l3 * l3 + m)
+                column += 1
+
+        # Non-persistent, exactly like the w3j buffers: reproducible constants
+        # rebuilt on load rather than stored in every checkpoint.
+        self.register_buffer("cg", cg, persistent=False)
+        self.register_buffer("col_path", torch.tensor(col_path, dtype=torch.long), persistent=False)
+        self.register_buffer("col_out", torch.tensor(col_out, dtype=torch.long), persistent=False)
+        self.dim_out = d3
+        if chunk_edges is None:
+            width = (channels or 1) * d1 * d2
+            chunk_edges = max(1, self.INTERMEDIATE_BUDGET // width)
+        self.chunk_edges = int(chunk_edges)
+
+    def _contract(self, x: torch.Tensor, y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        z = (x.unsqueeze(-1) * y.unsqueeze(-2)).flatten(-2)  # [E, C, D1 * D2]
+        q = z @ self.cg  # [E, C, S]
+        q = q * weights.index_select(1, self.col_path).transpose(1, 2)
+        out = q.new_zeros((*q.shape[:-1], self.dim_out))
+        return out.index_add(-1, self.col_out, q)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """``x``: ``[E, C, D1]``; ``y``: ``[E, D2]`` or ``[E, C, D2]``; ``w``: ``[E, P, C]``."""
+        if weights.shape[1] != self.num_paths:
+            raise ValueError(f"expected {self.num_paths} path weights, got {weights.shape[1]}")
+        if y.dim() == 2:
+            y = y.unsqueeze(1)
+        if x.shape[0] <= self.chunk_edges:
+            return self._contract(x, y, weights)
+        return torch.cat(
+            [
+                self._contract(xc, yc, wc)
+                for xc, yc, wc in zip(
+                    x.split(self.chunk_edges),
+                    y.split(self.chunk_edges),
+                    weights.split(self.chunk_edges),
+                    strict=True,
+                )
+            ],
+            dim=0,
+        )
+
+
+#: Interchangeable implementations of the weighted tensor product.  They differ
+#: only in scheduling; ``"gemm"`` is faster, ``"loop"`` uses less memory and is
+#: kept as the reference the fused kernel is tested against.
+TENSOR_PRODUCT_KINDS: dict[str, type[_TensorProductBase]] = {
+    "loop": WeightedTensorProduct,
+    "gemm": GemmWeightedTensorProduct,
+}
+
+
+def build_weighted_tensor_product(
+    kind: str, lmax_in1: int, lmax_in2: int, lmax_out: int, channels: int | None = None
+) -> _TensorProductBase:
+    """Instantiate the weighted tensor product named by ``kind``.
+
+    Both kinds compute the same function and carry no learnable parameters, so
+    a checkpoint trained with one loads unchanged into the other.
+    """
+    try:
+        cls = TENSOR_PRODUCT_KINDS[kind]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown tensor product '{kind}'; available: "
+            f"{', '.join(sorted(TENSOR_PRODUCT_KINDS))}"
+        ) from exc
+    if cls is GemmWeightedTensorProduct:
+        return cls(lmax_in1, lmax_in2, lmax_out, channels=channels)
+    return cls(lmax_in1, lmax_in2, lmax_out)
 
 
 class SelfTensorProduct(_TensorProductBase):

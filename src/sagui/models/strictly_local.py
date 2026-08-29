@@ -12,12 +12,16 @@ whose parallel decomposition needs a single-cutoff halo.
 SAGUI keeps that invariant explicitly:
 
 * a **pair embedding** ``x_ij`` from the two species and the radial basis;
-* an **environment descriptor** ``e_i = 1/sqrt(N) sum_k u(r_ik) g(x_ik)``, an
-  invariant summary of the neighbours of *i* only;
+* an **invariant environment descriptor**
+  ``e_i = 1/sqrt(kappa) sum_k u(r_ik) g(x_ik)``, a summary of the neighbours of
+  *i* only;
+* an **equivariant environment tensor**
+  ``Yhat_i[c,lm] = 1/sqrt(kappa) sum_k u(r_ik) g_cl(x_ik) Y_lm(rhat_ik)``,
+  which is what carries *angular* information about the neighbourhood;
 * ``L`` layers that update the pair tensor ``V_ij`` and the pair scalars
-  ``x_ij`` using **only** ``(x_ij, V_ij, e_i)``.  Crucially the update never
-  reads ``e_j``: that single restriction is what keeps the receptive field at
-  exactly one cutoff for any depth;
+  ``x_ij`` using **only** ``(x_ij, V_ij, Yhat_i, e_i)``.  Crucially the update
+  never reads ``e_j``: that single restriction is what keeps the receptive
+  field at exactly one cutoff for any depth;
 * an energy that is a sum over *pairs*,
 
   .. math:: E_i = \sum_{j \in \mathcal{N}(i)} u(r_{ij})\, \phi(x_{ij}^{(L)}) ,
@@ -29,6 +33,24 @@ The equivariant track is updated by the same weighted tensor product used by
 the message-passing model, with the weights produced by an MLP of the
 invariants -- so nonlinearity enters through the scalars while the ``l > 0``
 components stay exactly equivariant.
+
+Why the environment *tensor* matters
+------------------------------------
+Coupling ``V_ij`` against ``Y(rhat_ij)`` -- the edge's own direction -- looks
+natural but is a trap.  ``V_ij`` starts proportional to ``Y(rhat_ij)``, and the
+Clebsch-Gordan contraction of two equivariant functions of a *single* direction
+is again a function of that direction, so by induction
+
+    V_ij[c, l, m] = a_cl(invariants) * Y_lm(rhat_ij)
+
+at every depth.  Every rotation invariant of a single direction is a constant,
+so :func:`invariant_features` would return pure scalars and the atomic energy
+would depend only on the multiset of distances ``{(Z_k, r_ik)}`` -- the model
+would be exactly blind to bond angles, which was measured at machine precision
+before this was fixed.  Aggregating over ``N(i)`` first mixes many directions
+and breaks the collapse: the ``l1 = l2 = 1 -> l3 = 0`` path alone then yields
+``sum_k w_k (rhat_ij . rhat_ik)``, the cosine of the bond angle.  The sum still
+ranges over ``N(i)`` only, so the receptive field is untouched.
 """
 
 from __future__ import annotations
@@ -43,7 +65,7 @@ from ..config import ModelConfig
 from ..data.atomic_data import AtomicGraph
 from ..nn.blocks import (
     EquivariantLinear,
-    WeightedTensorProduct,
+    build_weighted_tensor_product,
     invariant_features,
     num_invariants,
     one_hot_species,
@@ -54,11 +76,61 @@ from ..nn.scatter import scatter_sum
 from .base import InteratomicPotential
 from .registry import register_model
 
-__all__ = ["StrictlyLocalModel", "LocalLayer"]
+__all__ = ["StrictlyLocalModel", "LocalLayer", "EnvironmentTensor"]
+
+
+class EnvironmentTensor(nn.Module):
+    r"""Equivariant summary of the neighbourhood of the central atom.
+
+    .. math::
+        \hat Y_i[c, lm] = \frac{1}{\sqrt{\bar\kappa}}
+            \sum_{k \in \mathcal{N}(i)}
+            u_p(r_{ik})\, g_{c,l}\bigl(x_{ik}\bigr)\, Y_{lm}(\hat r_{ik})
+
+    This is Allegro's environment embedding: a learned, per-channel and
+    per-degree weighted sum of the neighbour directions.  The weights are
+    functions of invariants, so the result transforms as
+    :math:`\hat Y \mapsto D^{(l)}(Q)\hat Y` blockwise.
+
+    The sum runs over the neighbours of *i* only, so an edge ``(i, j)`` that
+    consumes it gains no receptive field: strict locality is preserved exactly.
+    The envelope factor keeps the sum smooth as a neighbour leaves the cutoff
+    sphere, as :math:`C^2` continuity of the energy requires.
+    """
+
+    def __init__(self, channels: int, sh_lmax: int, latent_dim: int) -> None:
+        super().__init__()
+        self.channels, self.sh_lmax = int(channels), int(sh_lmax)
+        self.weights = nn.Linear(latent_dim, self.channels * (self.sh_lmax + 1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        sh: torch.Tensor,
+        envelope: torch.Tensor,
+        receivers: torch.Tensor,
+        num_nodes: int,
+        norm: torch.Tensor,
+    ) -> torch.Tensor:
+        """``x`` ``[E, d]``, ``sh`` ``[E, D]``, ``envelope`` ``[E, 1]`` -> ``[N, C, D]``."""
+        weights = self.weights(x).view(-1, self.channels, self.sh_lmax + 1)
+        blocks = [
+            weights[..., l : l + 1] * sh[:, None, SphericalLayout.block(l)]
+            for l in range(self.sh_lmax + 1)
+        ]
+        edge = torch.cat(blocks, dim=-1) * envelope[..., None]
+        return scatter_sum(edge, receivers, num_nodes) / norm
 
 
 class LocalLayer(nn.Module):
-    """One Allegro-style layer acting on a single edge (plus ``e_i``)."""
+    """One Allegro-style layer acting on a single edge.
+
+    Every input is a per-edge tensor, including the two environment summaries,
+    which the model aggregates before the call.  Keeping all aggregation in
+    :meth:`StrictlyLocalModel.node_energies` means the locality argument can be
+    audited in one function, and it leaves this ``forward`` free of graph
+    operations -- which is what makes it a good ``torch.compile`` target.
+    """
 
     def __init__(
         self,
@@ -67,10 +139,13 @@ class LocalLayer(nn.Module):
         latent_dim: int,
         env_dim: int,
         hidden: Sequence[int],
+        tensor_product: str = "gemm",
     ) -> None:
         super().__init__()
         self.layout = layout
-        self.tensor_product = WeightedTensorProduct(layout.lmax, sh_lmax, layout.lmax)
+        self.tensor_product = build_weighted_tensor_product(
+            tensor_product, layout.lmax, sh_lmax, layout.lmax, channels=layout.channels
+        )
         self.weight_mlp = MLP(
             latent_dim + env_dim,
             hidden,
@@ -85,14 +160,15 @@ class LocalLayer(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, v: torch.Tensor, sh: torch.Tensor, env: torch.Tensor
+        self, x: torch.Tensor, v: torch.Tensor, y: torch.Tensor, env: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``y`` is the second tensor-product operand, ``[E, D]`` or ``[E, C, D]``."""
         weights = self.weight_mlp(torch.cat([x, env], dim=-1)).view(
             -1, self.tensor_product.num_paths, self.layout.channels
         )
         # Residual updates are averaged (1/sqrt(2)) so that the activation
         # scale does not drift as layers are stacked.
-        v = (v + self.linear(self.tensor_product(v, sh, weights))) / math.sqrt(2.0)
+        v = (v + self.linear(self.tensor_product(v, y, weights))) / math.sqrt(2.0)
         invariants = invariant_features(v, self.layout)
         x = (x + self.scalar_mlp(torch.cat([x, invariants, env], dim=-1))) / math.sqrt(2.0)
         return x, v
@@ -101,6 +177,8 @@ class LocalLayer(nn.Module):
 @register_model("strictly_local")
 class StrictlyLocalModel(InteratomicPotential):
     """Many-body potential whose receptive field is exactly one cutoff."""
+
+    COMPILABLE_LAYERS = ("layers",)
 
     def __init__(
         self,
@@ -133,8 +211,27 @@ class StrictlyLocalModel(InteratomicPotential):
             latent_dim,
             final_bias=True,
         )
-        # Environment of the central atom, built from two-body terms only.
-        self.env_mlp = MLP(latent_dim, config.scalar_mlp_hidden, env_dim, final_bias=True)
+        # Invariant environment of the central atom.  One per layer when
+        # ``refresh_environment`` is set, so the descriptor is rebuilt from the
+        # current latents instead of being frozen at the two-body stage.
+        self.refresh_environment = bool(config.refresh_environment)
+        num_env = config.num_layers if self.refresh_environment else 1
+        self.env_mlps = nn.ModuleList(
+            [
+                MLP(latent_dim, config.scalar_mlp_hidden, env_dim, final_bias=True)
+                for _ in range(num_env)
+            ]
+        )
+        # Equivariant environment tensor -- the operand that carries angular
+        # information into the tensor product.  See the module docstring for
+        # why coupling against Y(rhat_ij) alone is not enough.
+        self.environment_tensor = bool(config.environment_tensor)
+        self.env_tensors = nn.ModuleList(
+            [
+                EnvironmentTensor(config.channels, self.sh_lmax, latent_dim)
+                for _ in range(config.num_layers if self.environment_tensor else 0)
+            ]
+        )
         # Initial equivariant edge tensor: channel/degree weights times Y(r_ij).
         self.embed_weights = nn.Linear(latent_dim, config.channels * (self.layout.lmax + 1))
 
@@ -146,6 +243,7 @@ class StrictlyLocalModel(InteratomicPotential):
                     latent_dim,
                     env_dim,
                     config.scalar_mlp_hidden,
+                    tensor_product=config.tensor_product,
                 )
                 for _ in range(config.num_layers)
             ]
@@ -161,6 +259,17 @@ class StrictlyLocalModel(InteratomicPotential):
         ]
         return torch.cat(blocks, dim=-1)
 
+    @staticmethod
+    def _invariant_environment(
+        mlp: MLP,
+        x: torch.Tensor,
+        envelope: torch.Tensor,
+        data: AtomicGraph,
+        norm: torch.Tensor,
+    ) -> torch.Tensor:
+        """``e_i``: invariant summary of N(i), damped by the envelope to stay smooth."""
+        return scatter_sum(mlp(x) * envelope, data.receivers, data.num_nodes) / norm
+
     def node_energies(
         self, data: AtomicGraph, vectors: torch.Tensor, lengths: torch.Tensor
     ) -> torch.Tensor:
@@ -174,14 +283,24 @@ class StrictlyLocalModel(InteratomicPotential):
         x = self.pair_embedding(
             torch.cat([one_hot[data.receivers], one_hot[data.senders], radial], dim=-1)
         )
-        # Invariant summary of N(i); damped by the envelope to stay smooth.
-        env_nodes = scatter_sum(
-            self.env_mlp(x) * envelope, data.receivers, data.num_nodes
-        ) / norm
-
         v = self._initial_tensor(x, sh)
-        for layer in self.layers:
-            x, v = layer(x, v, sh, env_nodes[data.receivers])
+
+        # Every aggregation in this architecture happens in this loop, and each
+        # one sums over N(i) alone -- which is the whole content of the
+        # receptive-field theorem.
+        env_nodes = self._invariant_environment(self.env_mlps[0], x, envelope, data, norm)
+        for index, layer in enumerate(self.layers):
+            if self.refresh_environment and index > 0:
+                env_nodes = self._invariant_environment(
+                    self.env_mlps[index], x, envelope, data, norm
+                )
+            if self.environment_tensor:
+                operand = self.env_tensors[index](
+                    x, sh, envelope, data.receivers, data.num_nodes, norm
+                )[data.receivers]
+            else:
+                operand = sh
+            x, v = layer(x, v, operand, env_nodes[data.receivers])
 
         pair_energy = (self.readout(x) * envelope).squeeze(-1)
         return scatter_sum(pair_energy, data.receivers, data.num_nodes)

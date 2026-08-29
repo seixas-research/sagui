@@ -37,6 +37,7 @@ class SaguiCalculator(Calculator):
         z_table: ZTable | None = None,
         device: str = "auto",
         default_dtype: str = "float64",
+        compile_layers: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -53,6 +54,12 @@ class SaguiCalculator(Calculator):
             no ``float64``, so on MPS this is downgraded to ``float32`` with a
             warning -- pass ``device="cpu"`` if the precision matters more than
             the throughput.
+        compile_layers:
+            Hand the layers to ``torch.compile`` -- roughly a 2x speed-up per
+            MD step, at the cost of a one-off compilation of tens of seconds.
+            Off by default because the compiled backward has been observed to
+            fail on large systems; benchmark it on your own system size before
+            turning it on, and see :meth:`InteratomicPotential.compile_layers`.
         """
         super().__init__(**kwargs)
         self.device, self.dtype = resolve_device_and_dtype(device, default_dtype)
@@ -70,6 +77,9 @@ class SaguiCalculator(Calculator):
             self.model = model.to(device=self.device, dtype=self.dtype).eval()
             self.z_table = z_table
             self.r_max = float(model.r_max.item())
+
+        if compile_layers:
+            self.model.compile_layers()
 
     def calculate(
         self,

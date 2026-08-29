@@ -51,7 +51,7 @@ from ..nn.blocks import (
     EquivariantLinear,
     SelfTensorProduct,
     SpeciesLinear,
-    WeightedTensorProduct,
+    build_weighted_tensor_product,
     embed_scalars,
     one_hot_species,
     scalars,
@@ -103,11 +103,14 @@ class InteractionBlock(nn.Module):
         radial_mlp_hidden: Sequence[int],
         num_species: int,
         correlation: int,
+        tensor_product: str = "gemm",
     ) -> None:
         super().__init__()
         self.layout = layout
         self.linear_up = EquivariantLinear(layout.lmax, layout.channels)
-        self.tensor_product = WeightedTensorProduct(layout.lmax, sh_lmax, layout.lmax)
+        self.tensor_product = build_weighted_tensor_product(
+            tensor_product, layout.lmax, sh_lmax, layout.lmax, channels=layout.channels
+        )
         self.radial_mlp = MLP(
             num_radial_basis,
             radial_mlp_hidden,
@@ -139,6 +142,8 @@ class InteractionBlock(nn.Module):
 @register_model("mace")
 class MACEModel(InteratomicPotential):
     """Equivariant message-passing potential with a many-body basis."""
+
+    COMPILABLE_LAYERS = ("interactions",)
 
     def __init__(
         self,
@@ -172,6 +177,7 @@ class MACEModel(InteratomicPotential):
                     config.radial_mlp_hidden,
                     self.num_species,
                     config.correlation,
+                    tensor_product=config.tensor_product,
                 )
                 for _ in range(config.num_layers)
             ]

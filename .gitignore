@@ -220,7 +220,7 @@ __marimo__/
 # SAGUI internal design document (kept out of version control)
 sagui_context.md
 sagui_quality_improvements.md
-
+sagui_performance_optimization.md
 
 # Training artefacts
 runs/

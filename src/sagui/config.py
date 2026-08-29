@@ -54,8 +54,23 @@ class ModelConfig:
     latent_dim: int = 64
     #: ``strictly_local`` only: hidden widths of the scalar-track MLPs.
     scalar_mlp_hidden: list[int] = field(default_factory=lambda: [64, 64])
+    #: ``strictly_local`` only: couple the edge tensor against an *aggregated*
+    #: equivariant environment tensor rather than the edge's own spherical
+    #: harmonic.  Without this the model is exactly blind to bond angles -- see
+    #: the module docstring of ``models/strictly_local.py``.  Turn it off only
+    #: to reproduce the pre-fix architecture.
+    environment_tensor: bool = True
+    #: ``strictly_local`` only: rebuild the invariant environment descriptor at
+    #: every layer from the current latents, instead of once from the two-body
+    #: embedding.
+    refresh_environment: bool = True
     #: Average neighbour count used to normalise sums; ``None`` -> from data.
     avg_num_neighbors: float | None = None
+    #: Scheduling of the Clebsch-Gordan product: ``"gemm"`` (one fused matrix
+    #: product, ~2x faster once compiled) or ``"loop"`` (one einsum per path,
+    #: lower peak memory).  The two compute the same function and share the
+    #: same parameters, so a checkpoint is portable between them.
+    tensor_product: str = "gemm"
 
     @property
     def spherical_lmax(self) -> int:

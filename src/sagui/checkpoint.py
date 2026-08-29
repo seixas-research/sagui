@@ -31,7 +31,9 @@ __all__ = [
 ]
 
 #: Bumped whenever the on-disk layout changes incompatibly.
-CHECKPOINT_FORMAT = 2
+# 3: ``strictly_local`` gained the equivariant environment tensor and the
+#    per-layer environment refresh, which changes its parameter set.
+CHECKPOINT_FORMAT = 3
 
 
 def save_checkpoint(
@@ -80,9 +82,18 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     payload = torch.load(path, map_location=map_location, weights_only=False)
     fmt = payload.get("format")
     if fmt != CHECKPOINT_FORMAT:
+        hint = ""
+        if fmt == 2:
+            hint = (
+                "\nFormat 2 predates the equivariant environment tensor.  Such a "
+                "'strictly_local' model is blind to bond angles and cannot be "
+                "converted; retrain it.  To load it anyway for comparison, set "
+                "model.environment_tensor=false and model.refresh_environment=false "
+                "and force the format field to 3."
+            )
         raise ValueError(
             f"checkpoint format {fmt} is not supported by sagui {__version__} "
-            f"(expected {CHECKPOINT_FORMAT})"
+            f"(expected {CHECKPOINT_FORMAT}){hint}"
         )
     return payload
 

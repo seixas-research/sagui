@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--print-forces", action="store_true", help="print the full force table per structure"
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the layers (~2x faster per step, tens of seconds to warm up)",
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
     return parser
 
@@ -71,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("running on %s in %s", device, str(dtype).replace("torch.", ""))
 
     model, config, z_table = load_model(args.model, device=device, dtype=dtype)
+    if args.compile:
+        logger.info("compiling %d layers (first batch will be slow)", model.compile_layers())
     logger.info(
         "loaded '%s' model (r_max=%.2f A, species: %s)",
         config.model.type,

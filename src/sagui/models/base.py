@@ -25,6 +25,7 @@ The base class owns everything that is *physics* rather than architecture:
 from __future__ import annotations
 
 import contextlib
+import warnings
 from collections.abc import Sequence
 
 import torch
@@ -38,6 +39,10 @@ __all__ = ["InteratomicPotential"]
 
 class InteratomicPotential(nn.Module):
     """Base class: subclasses only implement :meth:`node_energies`."""
+
+    #: Names of the ``nn.ModuleList`` attributes holding the repeated layers
+    #: that :meth:`compile_layers` hands to ``torch.compile``.
+    COMPILABLE_LAYERS: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -127,6 +132,59 @@ class InteratomicPotential(nn.Module):
             # the graph alive would pin the whole batch in memory.
             out = {key: value.detach() for key, value in out.items()}
         return out
+
+    # -------------------------------------------------------------- compile
+    def compile_layers(self, dynamic: bool = True, **compile_kwargs) -> int:
+        """Hand the repeated layers to ``torch.compile``; return how many.
+
+        Only the layers are compiled.  :meth:`forward` stays in eager mode
+        because it calls :func:`torch.autograd.grad`, and the graph builder
+        would break on the :class:`AtomicGraph` dataclass anyway; the layers
+        take tensors in and return tensors, which is what Dynamo handles well.
+
+        What is compiled is each layer's ``forward`` *method*, not the module.
+        Wrapping the module would nest it under ``_orig_mod`` and rename every
+        key in :meth:`state_dict`, silently breaking checkpoints.
+
+        ``dynamic=True`` is the default because the edge count changes at every
+        molecular-dynamics step; with static shapes each new count triggers a
+        full recompilation.
+
+        Notes
+        -----
+        Compilation pays off only once the tensor product is the fused
+        ``"gemm"`` kind: applied to the per-path loop, ``torch.compile`` has
+        been measured to make the model several times *slower*.  A warning is
+        issued in that case.
+
+        The compiled backward is the fragile part of this path.  Validate it at
+        your production system size on your production hardware before relying
+        on it -- keep the model usable without it, which is why this is an
+        explicit call and not something ``__init__`` does.
+        """
+        if not self.COMPILABLE_LAYERS:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not declare COMPILABLE_LAYERS"
+            )
+        kinds = {
+            type(module.tensor_product).__name__
+            for name in self.COMPILABLE_LAYERS
+            for module in getattr(self, name)
+            if hasattr(module, "tensor_product")
+        }
+        if "WeightedTensorProduct" in kinds:
+            warnings.warn(
+                "compile_layers() with the 'loop' tensor product is typically much "
+                "slower than eager; set model.tensor_product='gemm' first.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        compiled = 0
+        for name in self.COMPILABLE_LAYERS:
+            for module in getattr(self, name):
+                module.forward = torch.compile(module.forward, dynamic=dynamic, **compile_kwargs)
+                compiled += 1
+        return compiled
 
     # ----------------------------------------------------------------- misc
     def extra_repr(self) -> str:  # pragma: no cover - debugging helper

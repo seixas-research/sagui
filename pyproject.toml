@@ -34,7 +34,11 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-#   pip install -e ".[dev]"
+#   pip install -e ".[dev]"      development
+#   pip install -e ".[fast]"     optional inference accelerations
+fast = [
+    'vesin',   # 36-67x faster neighbour lists; see sagui_performance_optimization.md
+]
 dev = [
     'pytest-cov',
     'ruff',
