@@ -65,6 +65,7 @@ from ..config import ModelConfig
 from ..data.atomic_data import AtomicGraph
 from ..nn.blocks import (
     EquivariantLinear,
+    EquivariantRMSNorm,
     build_weighted_tensor_product,
     invariant_features,
     num_invariants,
@@ -140,9 +141,14 @@ class LocalLayer(nn.Module):
         env_dim: int,
         hidden: Sequence[int],
         tensor_product: str = "gemm",
+        layer_norm: bool = True,
+        cross_degree: bool = False,
     ) -> None:
         super().__init__()
         self.layout = layout
+        self.cross_degree = bool(cross_degree)
+        # Identity when disabled, so ``forward`` stays branch-free.
+        self.norm = EquivariantRMSNorm(layout) if layer_norm else nn.Identity()
         self.tensor_product = build_weighted_tensor_product(
             tensor_product, layout.lmax, sh_lmax, layout.lmax, channels=layout.channels
         )
@@ -153,7 +159,7 @@ class LocalLayer(nn.Module):
         )
         self.linear = EquivariantLinear(layout.lmax, layout.channels)
         self.scalar_mlp = MLP(
-            latent_dim + num_invariants(layout) + env_dim,
+            latent_dim + num_invariants(layout, self.cross_degree) + env_dim,
             hidden,
             latent_dim,
             final_bias=True,
@@ -168,8 +174,11 @@ class LocalLayer(nn.Module):
         )
         # Residual updates are averaged (1/sqrt(2)) so that the activation
         # scale does not drift as layers are stacked.
-        v = (v + self.linear(self.tensor_product(v, y, weights))) / math.sqrt(2.0)
-        invariants = invariant_features(v, self.layout)
+        # The normalisation is scale invariant, so the 1/sqrt(2) below is a
+        # no-op whenever it is enabled; it is what keeps the invariants read out
+        # on the next line bounded.
+        v = self.norm((v + self.linear(self.tensor_product(v, y, weights))) / math.sqrt(2.0))
+        invariants = invariant_features(v, self.layout, self.cross_degree)
         x = (x + self.scalar_mlp(torch.cat([x, invariants, env], dim=-1))) / math.sqrt(2.0)
         return x, v
 
@@ -194,6 +203,7 @@ class StrictlyLocalModel(InteratomicPotential):
             atomic_energies=atomic_energies,
             energy_scale=energy_scale,
             avg_num_neighbors=avg_num_neighbors,
+            zbl_cutoff=config.zbl_cutoff,
         )
         self.config = config
         self.layout = SphericalLayout(config.lmax, config.channels)
@@ -244,6 +254,8 @@ class StrictlyLocalModel(InteratomicPotential):
                     env_dim,
                     config.scalar_mlp_hidden,
                     tensor_product=config.tensor_product,
+                    layer_norm=config.layer_norm,
+                    cross_degree=config.cross_degree_invariants,
                 )
                 for _ in range(config.num_layers)
             ]

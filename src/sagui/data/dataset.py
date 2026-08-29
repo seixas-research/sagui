@@ -50,6 +50,7 @@ class AtomsDataset(Dataset):
         with_labels: bool = True,
         energy_key: str | None = None,
         forces_key: str | None = None,
+        stress_key: str | None = None,
         dtype: torch.dtype | None = None,
         cache: bool = False,
     ) -> None:
@@ -59,6 +60,7 @@ class AtomsDataset(Dataset):
         self.with_labels = with_labels
         self.energy_key = energy_key
         self.forces_key = forces_key
+        self.stress_key = stress_key
         self.dtype = dtype or torch.get_default_dtype()
         self._cache: dict[int, AtomicGraph] | None = {} if cache else None
 
@@ -75,6 +77,7 @@ class AtomsDataset(Dataset):
             with_labels=self.with_labels,
             energy_key=self.energy_key,
             forces_key=self.forces_key,
+            stress_key=self.stress_key,
             dtype=self.dtype,
         )
         if self._cache is not None:

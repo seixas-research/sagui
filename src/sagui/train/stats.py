@@ -68,7 +68,7 @@ def compute_statistics(
     # --- composition, energies and force magnitudes (no neighbour lists) ---
     counts_rows, energies, force_sq, n_force = [], [], 0.0, 0
     for atoms in dataset.frames:
-        energy, forces = extract_labels(atoms, dataset.energy_key, dataset.forces_key)
+        energy, forces, _ = extract_labels(atoms, dataset.energy_key, dataset.forces_key)
         if energy is not None:
             row = np.zeros(num_species)
             for z in atoms.get_atomic_numbers():

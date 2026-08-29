@@ -180,12 +180,13 @@ class EquivariantDenoiser(nn.Module):
         h = embed_scalars(self.token_embedding(tokens) + lattice_nodes, self.layout)
 
         sh = spherical_harmonics(self.sh_lmax, vectors)
-        radial = self.radial_basis(lengths) * self.cutoff(lengths)
+        envelope = self.cutoff(lengths)
+        radial = self.radial_basis(lengths) * envelope
         norm = torch.sqrt(self.avg_num_neighbors.to(dtype))
 
         for interaction, projection in zip(self.interactions, self.time_projections, strict=True):
             h = h + embed_scalars(projection(time_nodes), self.layout)
-            h = interaction(h, sh, radial, graph, norm)
+            h = interaction(h, sh, radial, envelope, graph, norm)
 
         features = torch.cat([invariant_features(h, self.layout), time_nodes], dim=-1)
 

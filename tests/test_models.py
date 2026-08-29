@@ -40,9 +40,10 @@ def make_model(architecture: str, z_table: ZTable, **overrides) -> InteratomicPo
     return build_model(ModelConfig(**settings), z_table.zs, avg_num_neighbors=6.0)
 
 
-def predict(model, atoms: Atoms, z_table: ZTable) -> dict[str, torch.Tensor]:
+def predict(model, atoms: Atoms, z_table: ZTable, **kwargs) -> dict[str, torch.Tensor]:
     graph = graph_from_atoms(atoms, z_table, R_MAX, with_labels=False)
-    return model(collate_graphs([graph]), compute_forces=True, training=False)
+    kwargs.setdefault("compute_forces", True)
+    return model(collate_graphs([graph]), training=False, **kwargs)
 
 
 def test_both_required_architectures_are_registered():
@@ -266,6 +267,31 @@ def test_atomic_energy_resolves_bond_angles(architecture):
     assert max(energies) - min(energies) > 1e-8
 
 
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_energy_is_smooth_across_the_cutoff(architecture):
+    """No kink where a neighbour enters the cutoff sphere.
+
+    The cutoff envelope vanishes with its first two derivatives, so the energy
+    is C^2 and the second derivative near ``r_max`` must be no larger than in
+    the interior.  A C^0 or C^1 potential injects energy at every crossing and
+    ruins microcanonical dynamics; this catches a normalisation or read-out
+    change that quietly breaks the property.
+    """
+    z_table = ZTable([8])
+    model = make_model(architecture, z_table)
+
+    def energy(r: float) -> float:
+        positions = np.array([[0.0, 0.0, 0.0], [1.6, 0.0, 0.0], [0.0, 1.7, 0.0], [r, 0.0, 0.0]])
+        atoms = Atoms(numbers=[8] * 4, positions=positions, cell=np.eye(3) * 30.0, pbc=False)
+        return float(predict(model, atoms, z_table)["energy"])
+
+    h = 2e-3
+    curvature = lambda centre: np.abs(  # noqa: E731
+        np.diff([energy(centre + k * h) for k in range(-6, 7)], 2) / h**2
+    ).max()
+    assert curvature(R_MAX) < 10.0 * max(curvature(2.0), 1e-3)
+
+
 def test_strictly_local_is_angle_blind_without_the_environment_tensor():
     """Pin the failure mode the flag exists to reproduce.
 
@@ -315,6 +341,87 @@ def test_message_passing_reaches_beyond_one_cutoff():
     # ... and one layer alone does not.
     one_layer = make_model("mace", z_table, num_layers=1)
     assert _energy_response_of_atom_zero(one_layer, z_table, 1.0) < 1e-14
+
+
+# ------------------------------------------------------------------------ stress
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_stress_matches_finite_differences(architecture, crystal):
+    """The analytic stress must be the numerical derivative of the energy.
+
+    The strain is applied to the cell *and* the scaled positions, which is the
+    deformation the analytic route differentiates; getting the shifts rebuilt
+    from the strained cell is the only reason the energy depends on the cell at
+    all.
+    """
+    z_table = ZTable([29])
+    model = make_model(architecture, z_table)
+    atoms = crystal * (2, 1, 1)
+
+    analytic = predict(model, atoms, z_table, compute_stress=True)["stress"][0]
+    volume = abs(np.linalg.det(atoms.get_cell().array))
+    cell0 = atoms.get_cell().array.copy()
+    scaled = atoms.get_scaled_positions().copy()
+
+    def energy(a: int, b: int, eps: float) -> float:
+        deform = np.eye(3)
+        deform[a, b] += eps / 2
+        deform[b, a] += eps / 2
+        strained = atoms.copy()
+        strained.set_cell(cell0 @ deform, scale_atoms=False)
+        strained.set_scaled_positions(scaled)
+        return float(predict(model, strained, z_table, compute_forces=False)["energy"])
+
+    h = 1e-6
+    numerical = np.array(
+        [[(energy(a, b, h) - energy(a, b, -h)) / (2 * h) / volume for b in range(3)]
+         for a in range(3)]
+    )
+    assert np.abs(analytic.detach().numpy() - numerical).max() < 1e-8
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_stress_is_symmetric(architecture, crystal):
+    """Only the symmetric part of the strain is physical, and it is all we apply."""
+    z_table = ZTable([29])
+    stress = predict(make_model(architecture, z_table), crystal, z_table,
+                     compute_stress=True)["stress"][0]
+    assert torch.allclose(stress, stress.T, atol=1e-14)
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_stress_is_rotation_covariant(architecture, crystal):
+    """A rank-two tensor: ``sigma -> Q sigma Q^T``."""
+    z_table = ZTable([29])
+    model = make_model(architecture, z_table)
+    rotation = rotation_matrix(0.6, 1.2, 0.4).to(torch.get_default_dtype())
+
+    rotated = crystal.copy()
+    rotated.set_positions(crystal.get_positions() @ rotation.numpy().T)
+    rotated.set_cell(crystal.get_cell().array @ rotation.numpy().T)
+
+    plain = predict(model, crystal, z_table, compute_stress=True)["stress"][0]
+    turned = predict(model, rotated, z_table, compute_stress=True)["stress"][0]
+    assert torch.allclose(turned, rotation @ plain @ rotation.T, atol=1e-10)
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_stress_is_zero_without_a_cell(architecture, cluster):
+    """A molecule has no volume, so no stress -- and certainly no NaN."""
+    z_table = ZTable([1, 6, 8])
+    stress = predict(make_model(architecture, z_table), cluster, z_table,
+                     compute_stress=True)["stress"]
+    assert torch.isfinite(stress).all()
+    assert torch.count_nonzero(stress) == 0
+
+
+def test_stress_requires_the_lattice_offsets(crystal):
+    """Hand-assembled graphs lack them; the error must say so."""
+    z_table = ZTable([29])
+    model = make_model("strictly_local", z_table)
+    graph = graph_from_atoms(crystal, z_table, R_MAX, with_labels=False)
+    graph.unit_shifts = None
+    with pytest.raises(ValueError, match="unit_shifts"):
+        model(collate_graphs([graph]), compute_stress=True, training=False)
 
 
 def test_registry_rejects_unknown_architectures():

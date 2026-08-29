@@ -49,6 +49,7 @@ from ..config import ModelConfig
 from ..data.atomic_data import AtomicGraph
 from ..nn.blocks import (
     EquivariantLinear,
+    EquivariantRMSNorm,
     SelfTensorProduct,
     SpeciesLinear,
     build_weighted_tensor_product,
@@ -104,9 +105,11 @@ class InteractionBlock(nn.Module):
         num_species: int,
         correlation: int,
         tensor_product: str = "gemm",
+        layer_norm: bool = True,
     ) -> None:
         super().__init__()
         self.layout = layout
+        self.norm = EquivariantRMSNorm(layout) if layer_norm else nn.Identity()
         self.linear_up = EquivariantLinear(layout.lmax, layout.channels)
         self.tensor_product = build_weighted_tensor_product(
             tensor_product, layout.lmax, sh_lmax, layout.lmax, channels=layout.channels
@@ -126,17 +129,23 @@ class InteractionBlock(nn.Module):
         h: torch.Tensor,
         sh: torch.Tensor,
         radial: torch.Tensor,
+        envelope: torch.Tensor,
         data: AtomicGraph,
         norm: torch.Tensor,
     ) -> torch.Tensor:
         weights = self.radial_mlp(radial).view(
             -1, self.tensor_product.num_paths, self.layout.channels
         )
+        # Damping the *message*, not just the radial features, is what makes the
+        # energy smooth at the cutoff.  ``radial`` already vanishes there, but
+        # ``radial_mlp`` carries hidden biases, so ``radial_mlp(0) != 0`` and the
+        # message would otherwise jump when a neighbour enters the sphere.
         messages = self.tensor_product(self.linear_up(h)[data.senders], sh, weights)
+        messages = messages * envelope.unsqueeze(-1)
         a = scatter_sum(messages, data.receivers, data.num_nodes) / norm
         a = self.linear_gather(a)
         b = self.contraction(a)
-        return self.linear_out(b) + self.self_interaction(h, data.species)
+        return self.norm(self.linear_out(b) + self.self_interaction(h, data.species))
 
 
 @register_model("mace")
@@ -159,6 +168,7 @@ class MACEModel(InteratomicPotential):
             atomic_energies=atomic_energies,
             energy_scale=energy_scale,
             avg_num_neighbors=avg_num_neighbors,
+            zbl_cutoff=config.zbl_cutoff,
         )
         self.config = config
         self.layout = SphericalLayout(config.lmax, config.channels)
@@ -178,6 +188,7 @@ class MACEModel(InteratomicPotential):
                     self.num_species,
                     config.correlation,
                     tensor_product=config.tensor_product,
+                    layer_norm=config.layer_norm,
                 )
                 for _ in range(config.num_layers)
             ]
@@ -198,11 +209,12 @@ class MACEModel(InteratomicPotential):
         h = embed_scalars(self.species_embedding(one_hot), self.layout)
 
         sh = spherical_harmonics(self.sh_lmax, vectors)
-        radial = self.radial_basis(lengths) * self.cutoff(lengths)
+        envelope = self.cutoff(lengths)
+        radial = self.radial_basis(lengths) * envelope
         norm = torch.sqrt(self.avg_num_neighbors.to(dtype))
 
         energy = vectors.new_zeros(data.num_nodes)
         for interaction, readout in zip(self.interactions, self.readouts, strict=True):
-            h = interaction(h, sh, radial, data, norm)
+            h = interaction(h, sh, radial, envelope, data, norm)
             energy = energy + readout(scalars(h)).squeeze(-1)
         return energy

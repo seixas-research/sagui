@@ -20,7 +20,7 @@ from ..models.base import InteratomicPotential
 from ..models.registry import build_model
 from ..utils import clip_gradients, count_parameters, resolve_device_and_dtype, set_seed
 from .ema import ExponentialMovingAverage
-from .loss import EnergyForcesLoss, compute_metrics
+from .loss import EnergyForcesStressLoss, compute_metrics
 from .stats import compute_statistics
 
 __all__ = ["run_training", "evaluate"]
@@ -40,15 +40,45 @@ def _reduce(totals: dict[str, float]) -> dict[str, float]:
     if n_forces:
         out["forces_mae"] = totals["forces_abs_sum"] / n_forces
         out["forces_rmse"] = math.sqrt(totals["forces_sq_sum"] / n_forces)
+    n_stress = totals.get("n_stress_components", 0.0)
+    if n_stress:
+        out["stress_mae"] = totals["stress_abs_sum"] / n_stress
+        out["stress_rmse"] = math.sqrt(totals["stress_sq_sum"] / n_stress)
     if "loss_sum" in totals and totals.get("n_batches"):
         out["loss"] = totals["loss_sum"] / totals["n_batches"]
     return out
 
 
+def switch_loss_phase(
+    loss_fn: EnergyForcesStressLoss,
+    optimizer: torch.optim.Optimizer,
+    logger: logging.Logger,
+) -> None:
+    """Swap the energy and force weights and drop the learning rate tenfold.
+
+    The MACE-MP and OMat24 recipes train with ``lambda_F > lambda_E`` for most
+    of the run -- forces carry ``3N`` numbers per structure and shape the local
+    geometry -- and then invert the ratio for the last stretch to sharpen the
+    energies, which are what thermodynamic quantities are read from.
+    """
+    loss_fn.energy_weight, loss_fn.forces_weight = (
+        loss_fn.forces_weight,
+        loss_fn.energy_weight,
+    )
+    for group in optimizer.param_groups:
+        group["lr"] = group["lr"] / 10.0
+    logger.info(
+        "loss phase switch: energy weight %.4g, force weight %.4g, lr %.3g",
+        loss_fn.energy_weight,
+        loss_fn.forces_weight,
+        optimizer.param_groups[0]["lr"],
+    )
+
+
 def evaluate(
     model: InteratomicPotential,
     loader: DataLoader,
-    loss_fn: EnergyForcesLoss,
+    loss_fn: EnergyForcesStressLoss,
     device: torch.device,
 ) -> dict[str, float]:
     """Error metrics over a whole loader (no parameter updates)."""
@@ -56,7 +86,9 @@ def evaluate(
     totals: dict[str, float] = {}
     for batch in loader:
         batch = batch.to(device)
-        prediction = model(batch, compute_forces=True, training=False)
+        prediction = model(
+            batch, compute_forces=True, compute_stress=loss_fn.wants_stress, training=False
+        )
         _, terms = loss_fn(prediction, batch)
         contributions = compute_metrics(prediction, batch)
         contributions["loss_sum"] = terms["loss"]
@@ -70,7 +102,7 @@ def _train_epoch(
     model: InteratomicPotential,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    loss_fn: EnergyForcesLoss,
+    loss_fn: EnergyForcesStressLoss,
     device: torch.device,
     ema: ExponentialMovingAverage | None,
     max_grad_norm: float | None,
@@ -81,7 +113,9 @@ def _train_epoch(
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
-        prediction = model(batch, compute_forces=True, training=True)
+        prediction = model(
+            batch, compute_forces=True, compute_stress=loss_fn.wants_stress, training=True
+        )
         loss, terms = loss_fn(prediction, batch)
         loss.backward()
 
@@ -119,6 +153,8 @@ def _format(prefix: str, metrics: dict[str, float]) -> str:
         parts.append(f"E-MAE={metrics['energy_mae'] * 1000:.3f} meV/atom")
     if "forces_mae" in metrics:
         parts.append(f"F-MAE={metrics['forces_mae'] * 1000:.2f} meV/A")
+    if "stress_mae" in metrics:
+        parts.append(f"S-MAE={metrics['stress_mae'] * 1000:.4f} meV/A^3")
     return " | ".join(parts)
 
 
@@ -156,6 +192,7 @@ def run_training(config: Config) -> Path:
         r_max=config.model.r_max,
         energy_key=config.data.energy_key,
         forces_key=config.data.forces_key,
+        stress_key=config.data.stress_key,
         dtype=dtype,
         cache=config.data.cache_graphs,
     )
@@ -199,7 +236,12 @@ def run_training(config: Config) -> Path:
         count_parameters(model),
     )
 
-    loss_fn = EnergyForcesLoss(training.energy_weight, training.forces_weight)
+    loss_fn = EnergyForcesStressLoss(
+        training.energy_weight,
+        training.forces_weight,
+        training.stress_weight,
+        training.huber_delta,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay
     )
@@ -223,7 +265,15 @@ def run_training(config: Config) -> Path:
     last_path = output_dir / "last.model"
     started = time.time()
 
+    switch_epoch = (
+        None
+        if training.force_weight_switch is None
+        else max(1, int(training.force_weight_switch * training.epochs))
+    )
+
     for epoch in range(1, training.epochs + 1):
+        if switch_epoch is not None and epoch == switch_epoch + 1:
+            switch_loss_phase(loss_fn, optimizer, logger)
         train_metrics = _train_epoch(
             model, train_loader, optimizer, loss_fn, device, ema, training.max_grad_norm
         )

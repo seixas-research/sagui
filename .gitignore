@@ -222,6 +222,10 @@ sagui_context.md
 sagui_quality_improvements.md
 sagui_performance_optimization.md
 
+# Extracted datasets: regenerable from the source JSON in ~30 s, never source
+examples/mptrj*.xyz
+examples/toy*.xyz
+
 # Training artefacts
 runs/
 *.pt

@@ -166,6 +166,122 @@ On a reference potential whose force variance is 41 % three-body, the fix is wor
 **9.3× on energy MAE and 2.6× on force MAE** (mean over 3 seeds), for 1.13× the
 runtime and 1.17× the parameters.
 
+## Equivariant normalisation (opt-in, and it did not help here)
+
+`model.layer_norm` enables `EquivariantRMSNorm`: each degree is rescaled by a
+rotation-invariant factor, taken **across channels**, after every layer. It is
+implemented, tested and exactly equivariant — and **off by default, because it was
+measured to hurt.**
+
+| learning rate | F-MAE, `layer_norm: false` | F-MAE, `layer_norm: true` |
+| --- | --- | --- |
+| 3e-3 | 154.5 | 214.4 |
+| 8e-3 | **84.2** | 252.9 |
+| 2e-2 | 198.6 | **136.8** |
+
+Best-against-best, after re-tuning the learning rate for each setting, it is
+84 → 137 meV/Å *worse* on that small clean target.
+
+**On real data it flips sign.** 800 MPtrj frames, 81 elements, 5 epochs, lr 2e-3:
+
+| configuration | E-MAE (meV/atom) | F-MAE (meV/Å) |
+| --- | --- | --- |
+| baseline | 1019.1 | 56.02 |
+| **`layer_norm: true`** | **831.4** | **45.18** |
+| `huber_delta: 0.01` | 2105.6 | **36.28** |
+| `huber_delta: 0.5` | 1665.5 | 42.12 |
+
+So `layer_norm` is worth **−18 % energy and −19 % force MAE** on a large, chemically
+diverse set and a clear loss on a small clean one — turn it on for the former. (The
+absolute errors are large because five epochs on 640 frames of 81-element data is
+badly undertrained; only the relative direction means anything.)
+
+`huber_delta` trades energy for forces here: forces improve 35 %, energies double.
+One `delta` is shared by terms whose residuals differ by orders of magnitude;
+per-term deltas would be the fix, and are not implemented.
+
+> Normalising **across channels** rather than per channel is a correctness
+> requirement: `invariant_features` reads the per-channel mean square straight back
+> out, so a per-channel norm would pin every `l>0` invariant to the gain and destroy
+> that half of the scalar track. `test_equivariant_rms_norm_preserves_the_higher_degree_invariants`
+> guards it.
+
+## Physical constraints and richer invariants
+
+Two `model` keys, both off by default, both cheap:
+
+| key | what it does |
+| --- | --- |
+| `zbl_cutoff` | add a parameter-free ZBL nuclear repulsion below this radius (Å) |
+| `cross_degree_invariants` | add the `(1,1)→2` cross-degree scalar to the read-out |
+
+**`zbl_cutoff`** fixes a specific failure. Training sets are built from
+configurations a sampler actually visits, so they contain almost no close contacts,
+and the repulsive wall the network learns there is pure extrapolation — often
+*attractive*. With the core on, the short-range force is repulsive by construction:
+
+```
+   r (Å)     F_x off      F_x on
+     0.4      0.1116    2062.2439
+     1.0     -0.0825      85.5013     <- the untrained network pulls atoms together
+     2.2     -0.0279      -0.0279     <- beyond the cutoff, bit-identical
+```
+
+It carries no parameters — it is a constraint, not another thing to fit — and it
+switches off through the same `C²` envelope used everywhere else, so the energy is
+still twice differentiable (verified: `E`, `E′` and `E″` all reach zero together).
+Around 1.5–2.0 Å is the useful range.
+
+**`cross_degree_invariants`** widens what the scalar track can see.
+`invariant_features` otherwise returns only per-degree squared norms, which are
+blind to how the `l=1` and `l=2` blocks sit relative to each other:
+
+```
+rotate ONLY the l=2 block:
+  per-degree norms  differ by 1.3e-15   <- blind
+  cross-degree term differs by 1.6e+01  <- sees it
+```
+
+Needs `lmax >= 2`; costs one extra channel-width per node.
+
+## Stress, virials and the training objective
+
+The stress comes from the same autograd pass as the forces: a symmetric strain is
+applied to the positions *and* the cell, the edge shifts are rebuilt from the
+strained cell, and `σ = V⁻¹ ∂E/∂ε` falls out of the backward. It agrees with finite
+differences to 1e-12, is exactly symmetric, and transforms as `σ → QσQᵀ`.
+
+```python
+out = model(batch, compute_forces=True, compute_stress=True)   # out["stress"]: [G, 3, 3]
+
+calc = SaguiCalculator(model="best.model")
+atoms.calc = calc
+atoms.get_stress()          # ASE Voigt order; only then is the extra backward paid for
+```
+
+Three training-objective options, all off by default:
+
+| key | effect |
+| --- | --- |
+| `training.stress_weight` | add a stress term (needs stress labels; `stress_key` configurable) |
+| `training.huber_delta` | Huber residual instead of mean square — **see the warning below** |
+| `training.force_weight_switch` | fraction of epochs after which the energy/force weights swap and the LR drops 10× (the MACE-MP schedule) |
+
+Ablated on 32 EMT-labelled Cu cells (one seed, 60 epochs — directions, not digits):
+
+| configuration | E-MAE | F-MAE | S-MAE (meV/Å³) |
+| --- | --- | --- | --- |
+| MSE, no stress | 44.5 | 66.4 | — |
+| MSE, `stress_weight=10` | **41.6** | 81.2 | 10.7 |
+| `huber_delta=0.01`, no stress | 69.0 | 114.6 | — |
+| `huber_delta=0.01`, `stress_weight=10` | 68.5 | 158.4 | **9.0** |
+
+> ⚠️ **`huber_delta` is an absolute residual threshold and must match your data.**
+> The MACE-MP value of `0.01` is tuned for MPtrj-scale per-atom energies; on a small
+> clean dataset nearly every residual already exceeds it, the loss degenerates to L1
+> with a small gradient, and accuracy drops sharply — as above. Default is `None`
+> (mean square). Tune it against your own residual scale.
+
 ## Inference speed
 
 Two settings matter for molecular dynamics, both measured on a 216-atom Si cell

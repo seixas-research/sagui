@@ -13,7 +13,10 @@ both supported architectures:
     mathematically identical and differ only in how the contraction is
     scheduled -- see :func:`build_weighted_tensor_product`;
 ``invariant_features``
-    reads rotation invariants back out so that ordinary MLPs can act on them.
+    reads rotation invariants back out so that ordinary MLPs can act on them;
+``EquivariantRMSNorm``
+    rescales each degree by a rotation-invariant factor, which keeps activations
+    bounded without touching the transformation law.
 
 Normalisation convention
 ------------------------
@@ -34,6 +37,7 @@ from .o3 import SphericalLayout, wigner_3j
 
 __all__ = [
     "EquivariantLinear",
+    "EquivariantRMSNorm",
     "SpeciesLinear",
     "WeightedTensorProduct",
     "GemmWeightedTensorProduct",
@@ -42,6 +46,7 @@ __all__ = [
     "build_weighted_tensor_product",
     "invariant_features",
     "num_invariants",
+    "has_cross_degree",
     "scalars",
     "embed_scalars",
 ]
@@ -58,23 +63,53 @@ def embed_scalars(s: torch.Tensor, layout: SphericalLayout) -> torch.Tensor:
     return torch.cat([s.unsqueeze(-1), zeros], dim=-1)
 
 
-def num_invariants(layout: SphericalLayout) -> int:
+def has_cross_degree(layout: SphericalLayout) -> bool:
+    """Whether :func:`invariant_features` can form a cross-degree invariant."""
+    return layout.lmax >= 2
+
+
+def num_invariants(layout: SphericalLayout, cross_degree: bool = False) -> int:
     """Width of :func:`invariant_features` for ``layout``."""
-    return layout.channels * (layout.lmax + 1)
+    extra = 1 if (cross_degree and has_cross_degree(layout)) else 0
+    return layout.channels * (layout.lmax + 1 + extra)
 
 
-def invariant_features(x: torch.Tensor, layout: SphericalLayout) -> torch.Tensor:
+def invariant_features(
+    x: torch.Tensor, layout: SphericalLayout, cross_degree: bool = False
+) -> torch.Tensor:
     r"""Extract rotation invariants: ``[N, C, D] -> [N, C * (lmax + 1)]``.
 
     The ``l = 0`` block is passed through unchanged; every ``l > 0`` block
     contributes its mean square :math:`\|x_l\|^2 / (2l + 1)`, which is
     invariant, smooth (unlike the norm, which is not differentiable at zero)
     and unit-scaled when the inputs are.
+
+    Those are all *within*-degree quantities.  Because an
+    :class:`EquivariantLinear` precedes this read-out, the network can recover
+    the full Gram matrix of each degree by polarisation, but nothing here
+    couples one degree to another.  ``cross_degree`` adds the lowest such
+    invariant,
+
+    .. math::
+        \iota^{\times}_c \;=\; \sum_{ijk} C^{1 1 2}_{ijk}\,
+            x^{(1)}_{c,i}\, x^{(1)}_{c,j}\, x^{(2)}_{c,k},
+
+    which is the projection of the degree-two block onto the symmetric
+    traceless square of the degree-one block -- information no combination of
+    per-degree norms can express.  It needs ``lmax >= 2`` and costs one extra
+    channel-width per node.
     """
     parts = [scalars(x)]
     for l in layout.ls[1:]:
         block = x[..., SphericalLayout.block(l)]
         parts.append(block.pow(2).sum(-1) / (2 * l + 1))
+    if cross_degree and has_cross_degree(layout):
+        coupling = wigner_3j(1, 1, 2).to(dtype=x.dtype, device=x.device)
+        vector = x[..., SphericalLayout.block(1)]
+        quadrupole = x[..., SphericalLayout.block(2)]
+        parts.append(
+            torch.einsum("nci,ncj,ijk,nck->nc", vector, vector, coupling, quadrupole)
+        )
     return torch.cat(parts, dim=-1)
 
 
@@ -104,6 +139,65 @@ class EquivariantLinear(nn.Module):
 
     def extra_repr(self) -> str:  # pragma: no cover - debugging helper
         return f"lmax={self.lmax}, {self.channels_in} -> {self.channels_out}"
+
+
+class EquivariantRMSNorm(nn.Module):
+    r"""Root-mean-square normalisation of each degree, taken *across channels*.
+
+    .. math::
+        \tilde V^{(l)}_{c}
+        \;=\; \gamma_{l,c}\;
+           \frac{V^{(l)}_{c}}
+                {\sqrt{\dfrac{1}{C}\sum_{c'}
+                 \dfrac{\lVert V^{(l)}_{c'}\rVert^2}{2l+1} + \epsilon}}
+
+    Equivariance is exact: the divisor is a sum of squared norms, hence a
+    rotation invariant, and :math:`\gamma` is one scalar per degree and
+    channel, so every block still transforms by :math:`D^{(l)}(Q)`.  Degrees are
+    normalised separately -- the "separable" scheme of EquiformerV2 -- because
+    they carry different natural scales.
+
+    Normalising *across channels* is a correctness requirement, not a
+    preference.  :func:`invariant_features` reads the per-channel mean square
+    :math:`\lVert V^{(l)}_c\rVert^2 / (2l+1)` back out, so normalising each
+    channel individually would pin every one of those invariants to
+    :math:`\gamma^2` and destroy the entire ``l > 0`` half of the scalar track
+    -- the same class of blindness the equivariant environment tensor exists to
+    avoid.  Taking the mean over channels instead fixes only that mean and
+    leaves the distribution across channels, which is what carries the
+    information, untouched.
+
+    The module is scale invariant, so a constant factor applied to the input --
+    for instance the ``1/sqrt(2)`` of a residual branch -- has no effect on the
+    output.
+
+    Parameters
+    ----------
+    layout:
+        The feature layout; supplies ``lmax`` and ``channels``.
+    eps:
+        Added inside the square root, so the map stays smooth (and the backward
+        finite) when a degree is identically zero.
+    """
+
+    def __init__(self, layout: SphericalLayout, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.layout = layout
+        self.eps = float(eps)
+        self.gain = nn.Parameter(torch.ones(layout.lmax + 1, layout.channels))
+
+    def forward(self, v: torch.Tensor) -> torch.Tensor:
+        """``[..., C, (lmax+1)**2] -> [..., C, (lmax+1)**2]``."""
+        out = []
+        for l in self.layout.ls:
+            block = v[..., SphericalLayout.block(l)]
+            mean_square = block.pow(2).sum(-1).div(2 * l + 1).mean(-1, keepdim=True)
+            scale = (mean_square + self.eps).sqrt().unsqueeze(-1)
+            out.append(block / scale * self.gain[l].view(1, -1, 1))
+        return torch.cat(out, dim=-1)
+
+    def extra_repr(self) -> str:  # pragma: no cover - debugging helper
+        return f"lmax={self.layout.lmax}, channels={self.layout.channels}, eps={self.eps:g}"
 
 
 class SpeciesLinear(nn.Module):

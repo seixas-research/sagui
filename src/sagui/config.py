@@ -46,6 +46,11 @@ class ModelConfig:
     radial_mlp_hidden: list[int] = field(default_factory=lambda: [64, 64])
     #: Polynomial order of the cutoff envelope.
     cutoff_p: int = 6
+    #: Radius below which a parameter-free ZBL nuclear repulsion is added, in
+    #: angstrom; ``None`` disables it.  Training sets contain almost no close
+    #: contacts, so the learned repulsive wall is an extrapolation and is
+    #: usually far too soft; ~1.5-2.0 is the useful range.
+    zbl_cutoff: float | None = None
     #: Hidden width of the final energy readout.
     readout_hidden: int = 16
     #: ``mace`` only: maximum correlation order of the many-body expansion.
@@ -54,6 +59,10 @@ class ModelConfig:
     latent_dim: int = 64
     #: ``strictly_local`` only: hidden widths of the scalar-track MLPs.
     scalar_mlp_hidden: list[int] = field(default_factory=lambda: [64, 64])
+    #: Add the ``(1, 1) -> 2`` cross-degree invariant to the scalar read-out.
+    #: Needs ``lmax >= 2``; the per-degree norms alone cannot express how the
+    #: degree-one and degree-two blocks are oriented relative to each other.
+    cross_degree_invariants: bool = False
     #: ``strictly_local`` only: couple the edge tensor against an *aggregated*
     #: equivariant environment tensor rather than the edge's own spherical
     #: harmonic.  Without this the model is exactly blind to bond angles -- see
@@ -64,6 +73,17 @@ class ModelConfig:
     #: every layer from the current latents, instead of once from the two-body
     #: embedding.
     refresh_environment: bool = True
+    #: Normalise the equivariant features per degree, across channels, after
+    #: every layer (:class:`sagui.nn.blocks.EquivariantRMSNorm`).
+    #:
+    #: **The sign of this one depends on the data.**  On a small clean angular
+    #: benchmark it hurt badly -- force MAE 84 -> 137 meV/A even after re-tuning
+    #: the learning rate for each setting.  On an 800-frame, 81-element MPtrj
+    #: subset it *helped*: energy MAE 1019 -> 831 meV/atom and force MAE
+    #: 56.0 -> 45.2 meV/A.  That is the regime its published gains come from.
+    #: Default off because a small dataset is the usual starting point; turn it
+    #: on for large, chemically diverse ones, and measure.
+    layer_norm: bool = False
     #: Average neighbour count used to normalise sums; ``None`` -> from data.
     avg_num_neighbors: float | None = None
     #: Scheduling of the Clebsch-Gordan product: ``"gemm"`` (one fused matrix
@@ -89,6 +109,7 @@ class DataConfig:
     #: Explicit label keys; ``None`` tries a list of common conventions.
     energy_key: str | None = None
     forces_key: str | None = None
+    stress_key: str | None = None
     #: Keep every neighbour list in memory (fast, only for small datasets).
     cache_graphs: bool = False
     num_workers: int = 0
@@ -138,6 +159,20 @@ class TrainingConfig:
     weight_decay: float = 5e-7
     energy_weight: float = 1.0
     forces_weight: float = 100.0
+    #: Weight of the stress term.  Zero (the default) skips the strain
+    #: derivative entirely; a positive value needs stress labels in the data.
+    stress_weight: float = 0.0
+    #: Huber transition point.  ``None`` keeps the mean-square loss.  An
+    #: absolute residual threshold, so it must match the data: ``0.01`` is the
+    #: MACE-MP value and suits MPtrj-scale energies.  Measured on MPtrj it
+    #: trades energy for forces -- force MAE 56.0 -> 36.3 meV/A but energy MAE
+    #: 1019 -> 2106 meV/atom -- because a single ``delta`` is shared by terms
+    #: with very different residual scales.  Per-term deltas would be the fix.
+    huber_delta: float | None = None
+    #: Fraction of training after which the energy and force weights swap and
+    #: the learning rate drops tenfold -- the MACE-MP two-phase schedule.
+    #: ``None`` disables it.
+    force_weight_switch: float | None = None
     max_grad_norm: float | None = 10.0
     #: Exponential moving average of the weights; ``None`` disables it.
     ema_decay: float | None = 0.99

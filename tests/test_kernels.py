@@ -22,9 +22,12 @@ from sagui.data.ztable import ZTable
 from sagui.models.registry import available_models, build_model
 from sagui.nn.blocks import (
     TENSOR_PRODUCT_KINDS,
+    EquivariantRMSNorm,
     GemmWeightedTensorProduct,
     build_weighted_tensor_product,
+    invariant_features,
 )
+from sagui.nn.o3 import SphericalLayout, rotation_matrix, wigner_D
 
 ARCHITECTURES = sorted(available_models())
 
@@ -98,6 +101,144 @@ def test_a_checkpoint_is_portable_between_tensor_products(architecture):
     gemm = build_model(ModelConfig(**settings, tensor_product="gemm"), atomic_numbers=[1])
     assert set(loop.state_dict()) == set(gemm.state_dict())
     gemm.load_state_dict(loop.state_dict())  # must not raise
+
+
+# -------------------------------------------------------------- normalisation
+def _rotate(v, layout, R):
+    return torch.cat(
+        [v[..., SphericalLayout.block(l)] @ wigner_D(l, R).T for l in layout.ls], dim=-1
+    )
+
+
+def test_equivariant_rms_norm_is_equivariant():
+    """The divisor is a sum of squared norms, so it must be rotation invariant."""
+    layout = SphericalLayout(lmax=2, channels=4)
+    norm = EquivariantRMSNorm(layout)
+    with torch.no_grad():
+        norm.gain.normal_(1.0, 0.2)
+    v = torch.randn(5, 4, 9) * 7.3
+    R = rotation_matrix(0.7, 1.1, 0.3)
+    assert torch.allclose(norm(_rotate(v, layout, R)), _rotate(norm(v), layout, R), atol=1e-12)
+
+
+def test_equivariant_rms_norm_is_scale_invariant():
+    """Which is why the 1/sqrt(2) residual factor before it is a no-op."""
+    layout = SphericalLayout(lmax=2, channels=4)
+    norm = EquivariantRMSNorm(layout, eps=1e-30)
+    v = torch.randn(5, 4, 9)
+    assert torch.allclose(norm(3.7 * v), norm(v), atol=1e-10)
+
+
+def test_equivariant_rms_norm_preserves_the_higher_degree_invariants():
+    """Normalising *per channel* instead of across them would be a silent disaster.
+
+    :func:`invariant_features` reads the per-channel mean square straight back
+    out, so a per-channel normalisation would pin every ``l > 0`` invariant to
+    the gain and destroy that half of the scalar track -- the same class of
+    blindness the equivariant environment tensor exists to avoid.
+    """
+    layout = SphericalLayout(lmax=2, channels=4)
+    norm = EquivariantRMSNorm(layout)
+    invariants = invariant_features(norm(torch.randn(16, 4, 9)), layout)
+    higher = invariants[:, layout.channels :]  # the l > 0 half
+    assert higher.std() > 0.1
+
+
+def test_equivariant_rms_norm_bounds_a_wild_input():
+    """The point of the layer: bound the invariants the scalar track reads."""
+    layout = SphericalLayout(lmax=2, channels=4)
+    norm = EquivariantRMSNorm(layout)
+    wild = torch.randn(8, 4, 9) * 1e4
+    assert float(norm(wild).abs().max().detach()) < 50.0
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_layer_norm_can_be_switched_off(architecture, crystal):
+    """Both settings must build, run and produce finite energies and forces."""
+    graph = graph_from_atoms(crystal, z_table=ZTable([29]), r_max=4.0, with_labels=False)
+    for enabled in (False, True):
+        torch.manual_seed(0)
+        model = build_model(
+            ModelConfig(type=architecture, r_max=4.0, lmax=2, channels=8, num_layers=2,
+                        latent_dim=16, scalar_mlp_hidden=[16], radial_mlp_hidden=[16],
+                        layer_norm=enabled),
+            atomic_numbers=[29],
+        )
+        out = model(graph, training=False)
+        assert torch.isfinite(out["energy"]).all()
+        assert torch.isfinite(out["forces"]).all()
+
+
+# ------------------------------------------------------- cross-degree invariants
+def test_cross_degree_invariant_is_rotation_invariant():
+    layout = SphericalLayout(lmax=2, channels=3)
+    v = torch.randn(4, 3, 9)
+    R = rotation_matrix(0.7, 1.1, 0.3)
+    turned = invariant_features(_rotate(v, layout, R), layout, cross_degree=True)
+    plain = invariant_features(v, layout, cross_degree=True)
+    assert torch.allclose(turned, plain, atol=1e-12)
+
+
+def test_cross_degree_invariant_sees_what_the_norms_cannot():
+    """Rotate only the l=2 block: the per-degree norms are blind to it.
+
+    That is exactly the information the extra term exists to expose -- how the
+    degree-one and degree-two blocks sit relative to one another.
+    """
+    layout = SphericalLayout(lmax=2, channels=3)
+    v = torch.randn(4, 3, 9)
+    R = rotation_matrix(0.7, 1.1, 0.3)
+    w = v.clone()
+    w[..., SphericalLayout.block(2)] = v[..., SphericalLayout.block(2)] @ wigner_D(2, R).T
+
+    norms_v = invariant_features(v, layout, cross_degree=False)
+    norms_w = invariant_features(w, layout, cross_degree=False)
+    assert torch.allclose(norms_v, norms_w, atol=1e-12)
+
+    cross_v = invariant_features(v, layout, cross_degree=True)[:, -layout.channels:]
+    cross_w = invariant_features(w, layout, cross_degree=True)[:, -layout.channels:]
+    assert (cross_v - cross_w).abs().max() > 1e-3
+
+
+def test_cross_degree_invariant_widens_the_read_out_consistently():
+    from sagui.nn.blocks import num_invariants
+
+    layout = SphericalLayout(lmax=2, channels=3)
+    v = torch.randn(2, 3, 9)
+    for flag in (False, True):
+        assert invariant_features(v, layout, flag).shape[-1] == num_invariants(layout, flag)
+
+
+def test_cross_degree_invariant_is_skipped_below_lmax_two():
+    """There is no (1, 1) -> 2 path to form, so the width must not change."""
+    from sagui.nn.blocks import num_invariants
+
+    layout = SphericalLayout(lmax=1, channels=3)
+    v = torch.randn(2, 3, 4)
+    assert invariant_features(v, layout, True).shape[-1] == num_invariants(layout, True)
+    assert torch.allclose(invariant_features(v, layout, True), invariant_features(v, layout))
+
+
+def test_cross_degree_model_stays_equivariant(crystal):
+    """The extra scalar must not leak into the transformation law."""
+    graph = graph_from_atoms(crystal, z_table=ZTable([29]), r_max=4.0, with_labels=False)
+    torch.manual_seed(0)
+    model = build_model(
+        ModelConfig(type="strictly_local", r_max=4.0, lmax=2, channels=8, num_layers=2,
+                    latent_dim=16, scalar_mlp_hidden=[16], cross_degree_invariants=True),
+        atomic_numbers=[29],
+    )
+    rotated = crystal.copy()
+    R = rotation_matrix(0.6, 1.2, 0.4).numpy()
+    rotated.set_positions(crystal.get_positions() @ R.T)
+    rotated.set_cell(crystal.get_cell().array @ R.T)
+    turned = graph_from_atoms(rotated, z_table=ZTable([29]), r_max=4.0, with_labels=False)
+
+    a, b = model(graph, training=False), model(turned, training=False)
+    assert torch.allclose(a["energy"], b["energy"], atol=1e-10)
+    assert torch.allclose(
+        a["forces"] @ torch.as_tensor(R, dtype=a["forces"].dtype).T, b["forces"], atol=1e-10
+    )
 
 
 # ------------------------------------------------------------------ compilation

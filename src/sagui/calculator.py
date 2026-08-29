@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
+from ase.stress import full_3x3_to_voigt_6_stress
 
 from .checkpoint import load_model
 from .data.atomic_data import collate_graphs, graph_from_atoms
@@ -29,7 +30,7 @@ __all__ = ["SaguiCalculator"]
 class SaguiCalculator(Calculator):
     """Evaluate a trained SAGUI model on ``ase.Atoms`` objects."""
 
-    implemented_properties = ["energy", "free_energy", "energies", "forces"]
+    implemented_properties = ["energy", "free_energy", "energies", "forces", "stress"]
 
     def __init__(
         self,
@@ -94,7 +95,12 @@ class SaguiCalculator(Calculator):
             self.atoms, self.z_table, self.r_max, with_labels=False, dtype=self.dtype
         )
         batch = collate_graphs([graph]).to(self.device)
-        out = self.model(batch, compute_forces=True, training=False)
+        # The strain derivative costs an extra backward, so only pay for it when
+        # the caller actually asks -- NPT dynamics does, plain NVE does not.
+        want_stress = "stress" in properties
+        out = self.model(
+            batch, compute_forces=True, compute_stress=want_stress, training=False
+        )
 
         self.results = {
             "energy": float(out["energy"].detach().cpu().item()),
@@ -102,6 +108,10 @@ class SaguiCalculator(Calculator):
             "forces": out["forces"].detach().cpu().numpy().astype(np.float64),
         }
         self.results["free_energy"] = self.results["energy"]
+        if want_stress:
+            # ASE wants Voigt order (xx, yy, zz, yz, xz, xy).
+            stress = out["stress"][0].detach().cpu().numpy().astype(np.float64)
+            self.results["stress"] = full_3x3_to_voigt_6_stress(stress)
 
     @torch.no_grad()
     def __repr__(self) -> str:  # pragma: no cover - debugging helper

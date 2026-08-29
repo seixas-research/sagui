@@ -38,6 +38,10 @@ import numpy as np
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import write
+from ase.stress import full_3x3_to_voigt_6_stress
+
+#: 1 GPa in eV/A^3.
+GPA_TO_EV_PER_A3 = 160.21766208
 
 #: Read granularity. Large enough that a single material always fits.
 CHUNK = 8 << 20
@@ -151,12 +155,17 @@ def to_atoms(record: dict, energy_key: str) -> Atoms | None:
     if forces.shape != (len(atoms), 3):
         return None
 
+    labels = {"energy": float(energy), "forces": forces}
     stress = record.get("stress")
-    atoms.calc = SinglePointCalculator(atoms, energy=float(energy), forces=forces)
-    atoms.info["mp_id"] = record.get("mp_id", "")
     if stress is not None:
-        # MPtrj stores stress in kBar; ASE wants eV/A^3 (1 kBar = 0.1 GPa).
-        atoms.info["mptrj_stress_kbar"] = np.array(stress, dtype=float).reshape(9).tolist()
+        # MPtrj carries the VASP stress in kBar.  ASE wants eV/A^3 and the
+        # opposite sign, so 1 kBar -> -0.1 / 160.21766208 eV/A^3.  The sign is
+        # checked empirically by --check-stress-sign: compressed frames must
+        # come out with a negative trace.
+        matrix = np.array(stress, dtype=float).reshape(3, 3) * (-0.1 / GPA_TO_EV_PER_A3)
+        labels["stress"] = full_3x3_to_voigt_6_stress(matrix)
+    atoms.calc = SinglePointCalculator(atoms, **labels)
+    atoms.info["mp_id"] = record.get("mp_id", "")
     return atoms
 
 
