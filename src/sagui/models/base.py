@@ -103,6 +103,35 @@ class InteratomicPotential(nn.Module):
         """
         raise NotImplementedError
 
+    def node_outputs(
+        self, data: AtomicGraph, vectors: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Per-atom energy plus any extra per-atom scalars.
+
+        Architectures that predict charges or magnetic moments override this
+        rather than :meth:`node_energies`, so the extra heads share the single
+        forward pass instead of provoking a second one.
+        """
+        return self.node_energies(data, vectors, lengths), {}
+
+    @staticmethod
+    def conserve_charge(raw: torch.Tensor, data: AtomicGraph) -> torch.Tensor:
+        r"""Shift predicted charges so each structure carries its reference total.
+
+        .. math:: q_i = \tilde q_i + \frac{Q - \sum_j \tilde q_j}{N}
+
+        Charge conservation is exact physics, so it is imposed as a projection
+        rather than asked for with a penalty term: the corrected charges satisfy
+        it identically, for any network output, and the correction is
+        differentiable so the head still learns.
+        """
+        totals = scatter_sum(raw, data.batch, data.num_graphs)
+        target = (
+            torch.zeros_like(totals) if data.total_charge is None else data.total_charge.to(raw)
+        )
+        correction = (target - totals) / data.num_atoms.to(raw.dtype)
+        return raw + correction[data.batch]
+
     # -------------------------------------------------------------- helpers
     @staticmethod
     def edge_vectors(
@@ -171,13 +200,20 @@ class InteratomicPotential(nn.Module):
                 displaced = positions
 
             vectors, lengths = self.edge_vectors(data, displaced, shifts)
-            raw = self.node_energies(data, vectors, lengths)
+            raw, extras = self.node_outputs(data, vectors, lengths)
             node_energy = self.energy_scale * raw + self.atomic_energies[data.species]
             if self.zbl is not None:
                 node_energy = node_energy + self.zbl(data, lengths)
             energy = scatter_sum(node_energy, data.batch, data.num_graphs)
 
             out: dict[str, torch.Tensor] = {"energy": energy, "node_energy": node_energy}
+            if "charges" in extras:
+                out["charges"] = self.conserve_charge(extras["charges"], data)
+            if "magmoms" in extras:
+                out["magmoms"] = extras["magmoms"]
+                out["total_magmom"] = scatter_sum(
+                    extras["magmoms"], data.batch, data.num_graphs
+                )
             if differentiate:
                 inputs = [positions] + ([strain] if compute_stress else [])
                 gradients = torch.autograd.grad(

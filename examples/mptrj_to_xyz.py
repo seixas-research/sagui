@@ -156,6 +156,12 @@ def to_atoms(record: dict, energy_key: str) -> Atoms | None:
         return None
 
     labels = {"energy": float(energy), "forces": forces}
+    magmom = record.get("magmom")
+    if magmom is not None:
+        magmom = np.asarray(magmom, dtype=float).reshape(-1)
+        if magmom.shape == (len(atoms),):
+            # Collinear moments, one per site; SAGUI reads them from `arrays`.
+            atoms.arrays["magmoms"] = magmom
     stress = record.get("stress")
     if stress is not None:
         # MPtrj carries the VASP stress in kBar.  ASE wants eV/A^3 and the

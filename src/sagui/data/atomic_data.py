@@ -14,12 +14,30 @@ from ase.stress import voigt_6_to_full_3x3_stress
 from .neighborlist import build_neighbor_list
 from .ztable import ZTable
 
-__all__ = ["AtomicGraph", "collate_graphs", "graph_from_atoms", "extract_labels"]
+__all__ = ["AtomicGraph", "Labels", "collate_graphs", "graph_from_atoms", "extract_labels"]
 
 #: Keys searched, in order, when looking for reference labels in an ``Atoms``.
 ENERGY_KEYS = ("energy", "REF_energy", "TotEnergy", "free_energy")
 FORCES_KEYS = ("forces", "REF_forces", "force")
 STRESS_KEYS = ("stress", "REF_stress")
+CHARGES_KEYS = ("charges", "REF_charges", "initial_charges")
+MAGMOMS_KEYS = ("magmoms", "REF_magmoms", "magmom", "initial_magmoms")
+
+
+@dataclass
+class Labels:
+    """Reference values found on an ``Atoms`` object.
+
+    A record rather than a tuple because the list keeps growing: energy and
+    forces first, then stress, then per-atom charges and magnetic moments.
+    """
+
+    energy: float | None = None
+    forces: np.ndarray | None = None
+    stress: np.ndarray | None = None
+    charges: np.ndarray | None = None
+    magmoms: np.ndarray | None = None
+    total_charge: float | None = None
 
 
 @dataclass
@@ -48,6 +66,10 @@ class AtomicGraph:
     energy: torch.Tensor | None = None  # [G]
     forces: torch.Tensor | None = None  # [N, 3]
     stress: torch.Tensor | None = None  # [G, 3, 3]
+    charges: torch.Tensor | None = None  # [N]
+    magmoms: torch.Tensor | None = None  # [N]
+    #: Net charge of each structure; the constraint the predicted charges obey.
+    total_charge: torch.Tensor | None = None  # [G]
 
     @property
     def num_graphs(self) -> int:
@@ -84,13 +106,29 @@ class AtomicGraph:
         return AtomicGraph(**moved)
 
 
+def _per_atom(atoms: Atoms, keys: tuple[str, ...], explicit: str | None) -> np.ndarray | None:
+    """Find a per-atom array under any of ``keys`` (or ``explicit`` if given)."""
+    for key in (explicit,) if explicit else keys:
+        if key in atoms.arrays:
+            value = np.asarray(atoms.arrays[key], dtype=float).reshape(-1)
+            if value.shape == (len(atoms),):
+                return value
+        if key in atoms.info:
+            value = np.asarray(atoms.info[key], dtype=float).reshape(-1)
+            if value.shape == (len(atoms),):
+                return value
+    return None
+
+
 def extract_labels(
     atoms: Atoms,
     energy_key: str | None = None,
     forces_key: str | None = None,
     stress_key: str | None = None,
-) -> tuple[float | None, np.ndarray | None, np.ndarray | None]:
-    """Pull reference energy, forces and stress out of an ``Atoms`` object.
+    charges_key: str | None = None,
+    magmoms_key: str | None = None,
+) -> Labels:
+    """Pull the reference labels out of an ``Atoms`` object.
 
     Looks first in ``atoms.info`` / ``atoms.arrays`` (where the extended-XYZ
     reader puts extra columns), then falls back to the attached calculator,
@@ -135,7 +173,21 @@ def extract_labels(
     if stress is not None:
         # Reference stresses come in either Voigt (6) or full (3, 3) form.
         stress = voigt_6_to_full_3x3_stress(stress) if stress.size == 6 else stress.reshape(3, 3)
-    return energy, forces, stress
+
+    charges = _per_atom(atoms, CHARGES_KEYS, charges_key)
+    magmoms = _per_atom(atoms, MAGMOMS_KEYS, magmoms_key)
+    total_charge = float(atoms.info["charge"]) if "charge" in atoms.info else None
+    if total_charge is None and charges is not None:
+        total_charge = float(charges.sum())
+
+    return Labels(
+        energy=energy,
+        forces=forces,
+        stress=stress,
+        charges=charges,
+        magmoms=magmoms,
+        total_charge=total_charge,
+    )
 
 
 def graph_from_atoms(
@@ -146,17 +198,20 @@ def graph_from_atoms(
     energy_key: str | None = None,
     forces_key: str | None = None,
     stress_key: str | None = None,
+    charges_key: str | None = None,
+    magmoms_key: str | None = None,
     dtype: torch.dtype | None = None,
 ) -> AtomicGraph:
     """Convert an ASE ``Atoms`` object into a single-structure :class:`AtomicGraph`."""
     dtype = dtype or torch.get_default_dtype()
     edge_index, shifts, unit_shifts = build_neighbor_list(atoms, r_max)
 
-    energy_value, forces_value, stress_value = (None, None, None)
-    if with_labels:
-        energy_value, forces_value, stress_value = extract_labels(
-            atoms, energy_key, forces_key, stress_key
-        )
+    labels = (
+        extract_labels(atoms, energy_key, forces_key, stress_key, charges_key, magmoms_key)
+        if with_labels
+        else Labels()
+    )
+    energy_value, forces_value, stress_value = labels.energy, labels.forces, labels.stress
 
     n_atoms = len(atoms)
     return AtomicGraph(
@@ -174,6 +229,15 @@ def graph_from_atoms(
             None
             if stress_value is None
             else torch.as_tensor(stress_value, dtype=dtype).unsqueeze(0)
+        ),
+        charges=(
+            None if labels.charges is None else torch.as_tensor(labels.charges, dtype=dtype)
+        ),
+        magmoms=(
+            None if labels.magmoms is None else torch.as_tensor(labels.magmoms, dtype=dtype)
+        ),
+        total_charge=torch.tensor(
+            [0.0 if labels.total_charge is None else labels.total_charge], dtype=dtype
         ),
     )
 
@@ -206,6 +270,8 @@ def collate_graphs(graphs: Sequence[AtomicGraph]) -> AtomicGraph:
     has_energy = all(g.energy is not None for g in graphs)
     has_forces = all(g.forces is not None for g in graphs)
     has_stress = all(g.stress is not None for g in graphs)
+    has_charges = all(g.charges is not None for g in graphs)
+    has_magmoms = all(g.magmoms is not None for g in graphs)
     has_unit_shifts = len(unit_shifts) == len(graphs)
     return AtomicGraph(
         positions=torch.cat(positions, dim=0),
@@ -219,4 +285,12 @@ def collate_graphs(graphs: Sequence[AtomicGraph]) -> AtomicGraph:
         energy=torch.cat([g.energy for g in graphs]) if has_energy else None,
         forces=torch.cat([g.forces for g in graphs], dim=0) if has_forces else None,
         stress=torch.cat([g.stress for g in graphs], dim=0) if has_stress else None,
+        charges=torch.cat([g.charges for g in graphs]) if has_charges else None,
+        magmoms=torch.cat([g.magmoms for g in graphs]) if has_magmoms else None,
+        total_charge=torch.cat(
+            [
+                g.total_charge if g.total_charge is not None else torch.zeros(1)
+                for g in graphs
+            ]
+        ),
     )

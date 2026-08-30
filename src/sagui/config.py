@@ -59,6 +59,15 @@ class ModelConfig:
     latent_dim: int = 64
     #: ``strictly_local`` only: hidden widths of the scalar-track MLPs.
     scalar_mlp_hidden: list[int] = field(default_factory=lambda: [64, 64])
+    #: ``strictly_local`` only: predict a partial charge per atom.  The
+    #: predicted charges are projected so that each structure's total matches
+    #: its reference (zero unless the data says otherwise), which is a hard
+    #: constraint rather than a penalty.
+    predict_charges: bool = False
+    #: ``strictly_local`` only: predict a collinear magnetic moment per atom.
+    #: The total moment is the sum, so training on local moments trains the
+    #: total for free.
+    predict_magmoms: bool = False
     #: Add the ``(1, 1) -> 2`` cross-degree invariant to the scalar read-out.
     #: Needs ``lmax >= 2``; the per-degree norms alone cannot express how the
     #: degree-one and degree-two blocks are oriented relative to each other.
@@ -110,6 +119,12 @@ class DataConfig:
     energy_key: str | None = None
     forces_key: str | None = None
     stress_key: str | None = None
+    #: ``atoms.info["config_type"]`` value marking single-atom reference
+    #: calculations, as MACE writes them.  Frames so marked are taken out of the
+    #: training set and their energies used directly as the per-element
+    #: references :math:`E^{(0)}_Z`; elements without one fall back to the
+    #: least-squares composition fit.  ``None`` disables the mechanism.
+    isolated_atom_config_type: str | None = "IsolatedAtom"
     #: Keep every neighbour list in memory (fast, only for small datasets).
     cache_graphs: bool = False
     num_workers: int = 0
@@ -162,6 +177,11 @@ class TrainingConfig:
     #: Weight of the stress term.  Zero (the default) skips the strain
     #: derivative entirely; a positive value needs stress labels in the data.
     stress_weight: float = 0.0
+    #: Weights of the per-atom property terms.  They need the matching model
+    #: heads (``model.predict_charges`` / ``model.predict_magmoms``) and labels
+    #: in the data; a term with either missing is silently skipped.
+    charges_weight: float = 0.0
+    magmoms_weight: float = 0.0
     #: Huber transition point.  ``None`` keeps the mean-square loss.  An
     #: absolute residual threshold, so it must match the data: ``0.01`` is the
     #: MACE-MP value and suits MPtrj-scale energies.  Measured on MPtrj it
@@ -169,10 +189,35 @@ class TrainingConfig:
     #: 1019 -> 2106 meV/atom -- because a single ``delta`` is shared by terms
     #: with very different residual scales.  Per-term deltas would be the fix.
     huber_delta: float | None = None
-    #: Fraction of training after which the energy and force weights swap and
-    #: the learning rate drops tenfold -- the MACE-MP two-phase schedule.
-    #: ``None`` disables it.
-    force_weight_switch: float | None = None
+    #: Per-term overrides, each falling back to ``huber_delta``.  Set them from
+    #: the residual scale of the matching label -- roughly its RMS -- so the
+    #: bulk of the data stays quadratic and only outliers are linearised.  A
+    #: term left ``None`` keeps its mean square, so the three can be mixed.
+    huber_delta_energy: float | None = None
+    huber_delta_forces: float | None = None
+    huber_delta_stress: float | None = None
+    #: Divide each loss term by the RMS residual of its label, measured on the
+    #: training set.  Makes the weights below comparable across terms (a weight
+    #: of 1 means the same thing for energies, forces and stress) and makes
+    #: ``huber_delta`` dimensionless.  With it on, start from weights of order
+    #: 1 rather than the unnormalised ``forces_weight=100``.
+    normalise_loss_terms: bool = False
+    #: Fraction of the run at which the loss weights switch: ``0.5`` switches at
+    #: the half-way epoch.  This is what MACE calls the start of its SWA stage,
+    #: but the name here says what it does -- parameter averaging is a separate
+    #: thing, provided by :attr:`ema_decay`.  ``None``
+    #: disables the second stage.  Forces carry ``3N`` numbers per structure and
+    #: shape the local geometry, so they dominate stage one; energies are what
+    #: thermodynamic quantities are read from, so they dominate stage two.
+    weight_switch: float | None = None
+    #: Stage-two loss weights.  Left at ``None`` they simply *swap* the stage-one
+    #: weights, which is the behaviour the name suggests; set them explicitly to
+    #: choose the second stage's balance instead.
+    weight_switch_energy_weight: float | None = None
+    weight_switch_forces_weight: float | None = None
+    #: Learning-rate multiplier applied at the switch.  MACE-MP drops an order
+    #: of magnitude; ``1.0`` leaves the rate alone.
+    weight_switch_lr_factor: float = 0.1
     max_grad_norm: float | None = 10.0
     #: Exponential moving average of the weights; ``None`` disables it.
     ema_decay: float | None = 0.99

@@ -244,6 +244,46 @@ rotate ONLY the l=2 block:
 
 Needs `lmax >= 2`; costs one extra channel-width per node.
 
+## Reference energies and two-stage training
+
+**Isolated-atom references.** Put single-atom calculations in the training
+`.xyz` marked the way MACE does, and their energies become the per-element
+references `E⁰_Z` directly instead of being fitted from composition:
+
+```
+1
+Properties=species:S:1:pos:R:3 energy=-3.75 config_type=IsolatedAtom pbc="T T T"
+Cu  0.0 0.0 0.0
+```
+
+Such frames are pulled out of both the training and validation splits — an atom
+with no neighbours has no environment to learn from — and any element without one
+falls back to the least-squares fit. The marker is configurable via
+`data.isolated_atom_config_type` (`None` disables it).
+
+**Two-stage weights.** `training.weight_switch` is a *fraction* of the run: `0.5`
+switches at the half-way epoch. Forces carry `3N` numbers per structure and shape
+the local geometry, so they dominate stage one; energies are what thermodynamic
+quantities are read from, so they dominate stage two.
+
+```yaml
+training:
+  energy_weight: 1.0
+  forces_weight: 100.0
+  weight_switch: 0.5             # switch after 50% of the epochs
+  weight_switch_energy_weight: 1000.0  # omit both to simply swap the stage-one weights
+  weight_switch_forces_weight: 10.0
+  weight_switch_lr_factor: 0.1         # learning-rate multiplier at the switch
+```
+
+> The objective itself changes at the switch, so the best-checkpoint tracker and
+> the plateau scheduler are reset there. Without that, stage two could never beat
+> stage one's best and would never save a model.
+
+This is the loss-reweighting half of what MACE bundles into its SWA stage; the
+name here says what it does. Parameter averaging is a separate mechanism,
+provided by `training.ema_decay`, which is on by default.
+
 ## Stress, virials and the training objective
 
 The stress comes from the same autograd pass as the forces: a symmetric strain is

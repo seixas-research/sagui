@@ -10,6 +10,9 @@ optimiser to discover that offset, we measure it:
   *binding* energy, which is small and roughly zero-centred;
 * an **energy scale** taken as the RMS force of the training set, so the
   gradient of the (scaled) network output starts at the right magnitude;
+* the **residual scale of each label** -- per-atom energy after the composition
+  fit, force components, stress components -- so that the loss terms can be put
+  on one footing and a weight of 1 means the same thing for each;
 * the **average number of neighbours**, used to normalise sums over neighbours
   so that activations do not grow with density.
 
@@ -28,9 +31,49 @@ from ..data.atomic_data import extract_labels
 from ..data.dataset import AtomsDataset
 from ..data.statistics import DatasetStatistics
 
-__all__ = ["DatasetStatistics", "compute_statistics"]
+__all__ = ["DatasetStatistics", "compute_statistics", "split_isolated_atoms"]
 
 logger = logging.getLogger(__name__)
+
+
+def split_isolated_atoms(
+    frames: list, config_type: str | None = "IsolatedAtom", energy_key: str | None = None
+) -> tuple[list, dict[int, float]]:
+    """Separate single-atom reference calculations from the training frames.
+
+    Follows the MACE convention: a frame carrying
+    ``atoms.info["config_type"] == config_type`` is a reference calculation for
+    one element, not a training configuration.  Its energy *is* the reference
+    energy :math:`E^{(0)}_Z`, so it is far more trustworthy than anything a
+    composition fit can recover -- and training on it would teach the model
+    nothing, since an atom with no neighbours has no environment to learn from.
+
+    Returns the remaining frames and a ``{atomic_number: energy}`` mapping.
+    """
+    if not config_type:
+        return list(frames), {}
+    kept, energies = [], {}
+    for atoms in frames:
+        if atoms.info.get("config_type") != config_type:
+            kept.append(atoms)
+            continue
+        numbers = atoms.get_atomic_numbers()
+        if len(numbers) != 1:
+            logger.warning(
+                "ignoring a '%s' frame with %d atoms; it must contain exactly one",
+                config_type,
+                len(numbers),
+            )
+            kept.append(atoms)
+            continue
+        energy = extract_labels(atoms, energy_key).energy
+        if energy is None:
+            logger.warning(
+                "ignoring a '%s' frame for Z=%d: no energy label", config_type, numbers[0]
+            )
+            continue
+        energies[int(numbers[0])] = float(energy)
+    return kept, energies
 
 
 def _fit_atomic_energies(
@@ -53,12 +96,15 @@ def compute_statistics(
     dataset: AtomsDataset,
     max_samples: int | None = 500,
     fit_atomic_energies: bool = True,
+    isolated_atom_energies: dict[int, float] | None = None,
 ) -> DatasetStatistics:
     """Measure reference energies, energy scale and neighbour count.
 
     ``max_samples`` bounds how many neighbour lists are built for the
     connectivity estimate; the composition fit always uses every labelled
-    structure.
+    structure.  ``isolated_atom_energies`` maps atomic number to a directly
+    measured :math:`E^{(0)}_Z`; those elements are taken as given and only the
+    remainder are fitted.
     """
     n_total = len(dataset)
     if n_total == 0:
@@ -67,8 +113,15 @@ def compute_statistics(
 
     # --- composition, energies and force magnitudes (no neighbour lists) ---
     counts_rows, energies, force_sq, n_force = [], [], 0.0, 0
+    stress_sq, n_stress = 0.0, 0
     for atoms in dataset.frames:
-        energy, forces, _ = extract_labels(atoms, dataset.energy_key, dataset.forces_key)
+        labels = extract_labels(
+            atoms, dataset.energy_key, dataset.forces_key, dataset.stress_key
+        )
+        energy, forces, stress = labels.energy, labels.forces, labels.stress
+        if stress is not None:
+            stress_sq += float(np.sum(np.square(stress)))
+            n_stress += int(np.size(stress))
         if energy is not None:
             row = np.zeros(num_species)
             for z in atoms.get_atomic_numbers():
@@ -87,6 +140,20 @@ def compute_statistics(
         if fit_atomic_energies
         else np.zeros(num_species)
     )
+    if isolated_atom_energies:
+        # A measured reference beats a fitted one, so it wins outright.
+        known = []
+        for z, value in isolated_atom_energies.items():
+            if z in dataset.z_table.zs:
+                atomic_energies[dataset.z_table.index(z)] = value
+                known.append(z)
+        missing = [z for z in dataset.z_table.zs if z not in isolated_atom_energies]
+        logger.info(
+            "reference energies: %d from isolated-atom frames, %d %s",
+            len(known),
+            len(missing),
+            "from the composition fit" if fit_atomic_energies else "left at zero",
+        )
 
     if n_force > 0:
         energy_scale = float(np.sqrt(force_sq / n_force))
@@ -114,8 +181,30 @@ def compute_statistics(
         )
         avg_num_neighbors = 1.0
 
+    # --- residual scales, so that a loss weight of 1 means the same thing
+    #     for every term.  The energy one is measured *after* the composition
+    #     fit, because that is what the network is actually asked to predict.
+    def _positive(value: float, what: str) -> float:
+        if not np.isfinite(value) or value < 1e-12:
+            logger.warning("degenerate %s scale (%.3e); falling back to 1.0", what, value)
+            return 1.0
+        return float(value)
+
+    if len(energies_arr) and counts.size:
+        per_atom = (energies_arr - counts @ atomic_energies) / np.maximum(
+            counts.sum(axis=1), 1.0
+        )
+        energy_residual_rms = _positive(float(np.sqrt(np.mean(per_atom**2))), "energy residual")
+    else:
+        energy_residual_rms = 1.0
+    forces_rms = _positive(float(np.sqrt(force_sq / n_force)) if n_force else 1.0, "force")
+    stress_rms = _positive(float(np.sqrt(stress_sq / n_stress)) if n_stress else 1.0, "stress")
+
     return DatasetStatistics(
         atomic_energies=atomic_energies,
         energy_scale=energy_scale,
         avg_num_neighbors=avg_num_neighbors,
+        energy_residual_rms=energy_residual_rms,
+        forces_rms=forces_rms,
+        stress_rms=stress_rms,
     )

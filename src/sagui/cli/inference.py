@@ -168,7 +168,8 @@ def _report_errors(frames, energies, forces) -> None:
     e_abs, e_sq, n_e = 0.0, 0.0, 0
     f_abs, f_sq, n_f = 0.0, 0.0, 0
     for atoms, energy, force in zip(frames, energies, forces, strict=True):
-        ref_energy, ref_forces, _ = extract_labels(atoms)
+        labels = extract_labels(atoms)
+        ref_energy, ref_forces = labels.energy, labels.forces
         if ref_energy is not None:
             error = (energy - ref_energy) / len(atoms)
             e_abs += abs(error)

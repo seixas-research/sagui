@@ -21,7 +21,7 @@ from ..models.registry import build_model
 from ..utils import clip_gradients, count_parameters, resolve_device_and_dtype, set_seed
 from .ema import ExponentialMovingAverage
 from .loss import EnergyForcesStressLoss, compute_metrics
-from .stats import compute_statistics
+from .stats import compute_statistics, split_isolated_atoms
 
 __all__ = ["run_training", "evaluate"]
 
@@ -49,26 +49,35 @@ def _reduce(totals: dict[str, float]) -> dict[str, float]:
     return out
 
 
-def switch_loss_phase(
+def apply_weight_switch(
     loss_fn: EnergyForcesStressLoss,
     optimizer: torch.optim.Optimizer,
     logger: logging.Logger,
+    energy_weight: float | None = None,
+    forces_weight: float | None = None,
+    lr_factor: float = 0.1,
 ) -> None:
-    """Swap the energy and force weights and drop the learning rate tenfold.
+    """Re-weight the loss for the second stage of training.
 
     The MACE-MP and OMat24 recipes train with ``lambda_F > lambda_E`` for most
     of the run -- forces carry ``3N`` numbers per structure and shape the local
     geometry -- and then invert the ratio for the last stretch to sharpen the
     energies, which are what thermodynamic quantities are read from.
+
+    With no explicit weights the two are simply swapped.  Supplying them lets
+    the second stage take any balance, which is what MACE's ``weight_switch_energy_weight``
+    and ``weight_switch_forces_weight`` do.
     """
-    loss_fn.energy_weight, loss_fn.forces_weight = (
-        loss_fn.forces_weight,
-        loss_fn.energy_weight,
-    )
+    if energy_weight is None and forces_weight is None:
+        energy_weight, forces_weight = loss_fn.forces_weight, loss_fn.energy_weight
+    if energy_weight is not None:
+        loss_fn.energy_weight = float(energy_weight)
+    if forces_weight is not None:
+        loss_fn.forces_weight = float(forces_weight)
     for group in optimizer.param_groups:
-        group["lr"] = group["lr"] / 10.0
+        group["lr"] = group["lr"] * float(lr_factor)
     logger.info(
-        "loss phase switch: energy weight %.4g, force weight %.4g, lr %.3g",
+        "stage two: energy weight %.4g, force weight %.4g, lr %.3g",
         loss_fn.energy_weight,
         loss_fn.forces_weight,
         optimizer.param_groups[0]["lr"],
@@ -173,12 +182,25 @@ def run_training(config: Config) -> Path:
     if not config.data.train_file:
         raise ValueError("data.train_file is required")
     train_frames = read_structures(config.data.train_file)
+    train_frames, isolated_energies = split_isolated_atoms(
+        train_frames, config.data.isolated_atom_config_type, config.data.energy_key
+    )
+    if isolated_energies:
+        logger.info(
+            "found %d isolated-atom reference energies in %s",
+            len(isolated_energies),
+            config.data.train_file,
+        )
     if config.data.valid_file:
         valid_frames = read_structures(config.data.valid_file)
     else:
         train_frames, valid_frames = random_split(
             train_frames, config.data.valid_fraction, seed=training.seed
         )
+    # Reference frames must never reach the validation split either.
+    valid_frames, _ = split_isolated_atoms(
+        valid_frames, config.data.isolated_atom_config_type, config.data.energy_key
+    )
     logger.info("training on %s in %s", device, str(dtype).replace("torch.", ""))
     logger.info(
         "loaded %d training and %d validation structures", len(train_frames), len(valid_frames)
@@ -199,7 +221,11 @@ def run_training(config: Config) -> Path:
     train_set = AtomsDataset(train_frames, **dataset_kwargs)
     valid_set = AtomsDataset(valid_frames, **dataset_kwargs) if valid_frames else None
 
-    stats = compute_statistics(train_set, fit_atomic_energies=training.fit_atomic_energies)
+    stats = compute_statistics(
+        train_set,
+        fit_atomic_energies=training.fit_atomic_energies,
+        isolated_atom_energies=isolated_energies,
+    )
     logger.info("%r", stats)
 
     train_loader = DataLoader(
@@ -240,8 +266,30 @@ def run_training(config: Config) -> Path:
         training.energy_weight,
         training.forces_weight,
         training.stress_weight,
+        training.charges_weight,
+        training.magmoms_weight,
         training.huber_delta,
+        training.huber_delta_energy,
+        training.huber_delta_forces,
+        training.huber_delta_stress,
+        scales=(
+            {
+                "energy": stats.energy_residual_rms,
+                "forces": stats.forces_rms,
+                "stress": stats.stress_rms,
+            }
+            if training.normalise_loss_terms
+            else None
+        ),
     )
+    if training.normalise_loss_terms:
+        logger.info(
+            "loss terms normalised by residual RMS: energy %.4g eV/atom, forces %.4g eV/A, "
+            "stress %.4g eV/A^3",
+            stats.energy_residual_rms,
+            stats.forces_rms,
+            stats.stress_rms,
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=training.learning_rate, weight_decay=training.weight_decay
     )
@@ -267,13 +315,35 @@ def run_training(config: Config) -> Path:
 
     switch_epoch = (
         None
-        if training.force_weight_switch is None
-        else max(1, int(training.force_weight_switch * training.epochs))
+        if training.weight_switch is None
+        else max(1, int(training.weight_switch * training.epochs))
     )
+    if switch_epoch is not None:
+        logger.info(
+            "stage two begins after epoch %d of %d (weight_switch=%.2f)",
+            switch_epoch,
+            training.epochs,
+            training.weight_switch,
+        )
 
     for epoch in range(1, training.epochs + 1):
         if switch_epoch is not None and epoch == switch_epoch + 1:
-            switch_loss_phase(loss_fn, optimizer, logger)
+            apply_weight_switch(
+                loss_fn,
+                optimizer,
+                logger,
+                training.weight_switch_energy_weight,
+                training.weight_switch_forces_weight,
+                training.weight_switch_lr_factor,
+            )
+            # The objective itself changed, so every number tracked against the
+            # old one is now meaningless.  Without this reset stage two can
+            # never beat stage one's best and would never save a checkpoint,
+            # and the plateau scheduler would read the jump as a catastrophe.
+            best_loss = float("inf")
+            scheduler.best = float("inf")
+            scheduler.num_bad_epochs = 0
+            scheduler.cooldown_counter = 0
         train_metrics = _train_epoch(
             model, train_loader, optimizer, loss_fn, device, ema, training.max_grad_norm
         )
@@ -319,6 +389,11 @@ def run_training(config: Config) -> Path:
         json.dump(history, handle, indent=2)
 
     elapsed = time.time() - started
-    logger.info("training finished in %.1f s; best objective %.6f", elapsed, best_loss)
+    logger.info(
+        "training finished in %.1f s; best objective %.6f%s",
+        elapsed,
+        best_loss,
+        " (stage two)" if switch_epoch is not None and training.epochs > switch_epoch else "",
+    )
     logger.info("best model: %s", best_path)
     return best_path

@@ -261,6 +261,18 @@ class StrictlyLocalModel(InteratomicPotential):
             ]
         )
         self.readout = MLP(latent_dim, [config.readout_hidden], 1, final_bias=False)
+        # Extra per-atom scalars share the trunk and differ only in their head,
+        # so predicting them costs one small MLP each and shapes the shared
+        # representation -- which is most of the reason to want them.
+        self.property_heads = nn.ModuleDict()
+        if config.predict_charges:
+            self.property_heads["charges"] = MLP(
+                latent_dim, [config.readout_hidden], 1, final_bias=False
+            )
+        if config.predict_magmoms:
+            self.property_heads["magmoms"] = MLP(
+                latent_dim, [config.readout_hidden], 1, final_bias=False
+            )
 
     def _initial_tensor(self, x: torch.Tensor, sh: torch.Tensor) -> torch.Tensor:
         """``[E, latent] , [E, D_sh] -> [E, C, D]`` equivariant edge features."""
@@ -285,6 +297,11 @@ class StrictlyLocalModel(InteratomicPotential):
     def node_energies(
         self, data: AtomicGraph, vectors: torch.Tensor, lengths: torch.Tensor
     ) -> torch.Tensor:
+        return self.node_outputs(data, vectors, lengths)[0]
+
+    def node_outputs(
+        self, data: AtomicGraph, vectors: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         dtype = vectors.dtype
         one_hot = one_hot_species(data.species, self.num_species, dtype)
         envelope = self.cutoff(lengths)
@@ -314,5 +331,12 @@ class StrictlyLocalModel(InteratomicPotential):
                 operand = sh
             x, v = layer(x, v, operand, env_nodes[data.receivers])
 
-        pair_energy = (self.readout(x) * envelope).squeeze(-1)
-        return scatter_sum(pair_energy, data.receivers, data.num_nodes)
+        def to_atoms(head: MLP) -> torch.Tensor:
+            """Pool an edge-wise head onto atoms, damped like the energy read-out."""
+            return scatter_sum(
+                (head(x) * envelope).squeeze(-1), data.receivers, data.num_nodes
+            )
+
+        energy = to_atoms(self.readout)
+        extras = {name: to_atoms(head) for name, head in self.property_heads.items()}
+        return energy, extras

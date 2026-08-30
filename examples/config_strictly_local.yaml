@@ -25,8 +25,13 @@ training:
   energy_weight: 1.0
   forces_weight: 100.0
   # stress_weight: 10.0        # needs stress labels; adds one backward per step
-  # huber_delta: 0.01          # match this to YOUR residual scale, do not copy it
-  # force_weight_switch: 0.6   # swap E/F weights and drop the lr 10x at 60% of training
+  # huber_delta: 0.01          # shared fallback; an ABSOLUTE threshold
+  # huber_delta_energy: 0.3    # per-term is what you usually want: set each from
+  # huber_delta_forces: 0.05   # the RMS residual of that label, since per-atom
+  # huber_delta_stress: 0.01   # energies, forces and stresses differ by orders
+  # weight_switch: 0.5             # stage two at 50% of the epochs: swap the E/F
+  # weight_switch_energy_weight: 1000.0  # weights (or set them explicitly) and scale the
+  # weight_switch_forces_weight: 10.0    # learning rate by weight_switch_lr_factor (default 0.1)
   ema_decay: 0.99
   device: auto
   default_dtype: float32

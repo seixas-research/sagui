@@ -24,12 +24,22 @@ class DatasetStatistics:
     energy_scale: float
     #: Mean number of neighbours within the cutoff, used to normalise sums.
     avg_num_neighbors: float
+    #: RMS of each label's *residual* after the composition fit, used to put the
+    #: loss terms on one scale.  Not the same as ``energy_scale``, which scales
+    #: the network output: these describe how large each term's error is, so
+    #: that a weight of 1 means the same thing for energies, forces and stress.
+    energy_residual_rms: float = 1.0
+    forces_rms: float = 1.0
+    stress_rms: float = 1.0
 
     def to_dict(self) -> dict:
         return {
             "atomic_energies": [float(x) for x in self.atomic_energies],
             "energy_scale": float(self.energy_scale),
             "avg_num_neighbors": float(self.avg_num_neighbors),
+            "energy_residual_rms": float(self.energy_residual_rms),
+            "forces_rms": float(self.forces_rms),
+            "stress_rms": float(self.stress_rms),
         }
 
     @classmethod
@@ -38,6 +48,10 @@ class DatasetStatistics:
             atomic_energies=np.asarray(raw["atomic_energies"], dtype=float),
             energy_scale=float(raw["energy_scale"]),
             avg_num_neighbors=float(raw["avg_num_neighbors"]),
+            # Defaults keep checkpoints written before these existed loadable.
+            energy_residual_rms=float(raw.get("energy_residual_rms", 1.0)),
+            forces_rms=float(raw.get("forces_rms", 1.0)),
+            stress_rms=float(raw.get("stress_rms", 1.0)),
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
